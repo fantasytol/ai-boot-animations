@@ -228,6 +228,37 @@ namespace ClaudeBootAnimation
         [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int cmd);
         [DllImport("user32.dll")] public static extern bool SetLayeredWindowAttributes(IntPtr h, uint key, byte alpha, uint flags);
         [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
+        [DllImport("user32.dll")] static extern bool SetProcessDpiAwarenessContext(IntPtr ctx);
+        [DllImport("shcore.dll")] static extern int SetProcessDpiAwareness(int v);
+        [DllImport("user32.dll")] static extern IntPtr MonitorFromWindow(IntPtr h, uint flags);
+        [StructLayout(LayoutKind.Sequential)] struct MONITORINFO { public int cbSize; public RECT rcMonitor, rcWork; public int dwFlags; }
+        [DllImport("user32.dll")] static extern bool GetMonitorInfo(IntPtr mon, ref MONITORINFO mi);
+
+        /// 每块屏单独按自己的缩放算坐标（Per-Monitor V2）。只认登录时缩放（SetProcessDPIAware）的话，
+        /// 目标窗口在缩放不同的副屏上、或改了缩放没注销时，读到的窗口位置和摆浮层用的坐标对不上，浮层会缩小、错位（#7）。
+        /// 老系统没有新接口就一级级往回退
+        public static string UseDpiAwareness()
+        {
+            string before = "";
+            try { before = "（之前=" + GetAwarenessFromDpiAwarenessContext(GetThreadDpiAwarenessContext()) + "）"; } catch { }
+            try { if (SetProcessDpiAwarenessContext(new IntPtr(-4))) return "每块屏单独缩放 V2" + before; } catch { }
+            try { if (SetProcessDpiAwareness(2) == 0) return "每块屏单独缩放" + before; } catch { }
+            try { SetProcessDPIAware(); } catch { }
+            return "只认登录时缩放" + before;
+        }
+        [DllImport("user32.dll")] static extern IntPtr GetThreadDpiAwarenessContext();
+        [DllImport("user32.dll")] static extern int GetAwarenessFromDpiAwarenessContext(IntPtr ctx);
+
+        /// 窗口所在显示器的整块屏幕矩形，物理像素
+        public static bool MonitorRect(IntPtr h, out RECT r)
+        {
+            r = new RECT();
+            IntPtr mon = MonitorFromWindow(h, 2 /*MONITOR_DEFAULTTONEAREST*/);
+            if (mon == IntPtr.Zero) return false;
+            var mi = new MONITORINFO { cbSize = Marshal.SizeOf(typeof(MONITORINFO)) };
+            if (!GetMonitorInfo(mon, ref mi)) return false;
+            r = mi.rcMonitor; return true;
+        }
         [StructLayout(LayoutKind.Sequential)] public struct POINT { public int X, Y; }
         [DllImport("user32.dll")] public static extern IntPtr WindowFromPoint(POINT p);
         [DllImport("user32.dll")] public static extern IntPtr GetDC(IntPtr h);
@@ -467,7 +498,7 @@ namespace ClaudeBootAnimation
             else introGone = true;
 
             // 一个窗口三层：最下面视频（整体调透明度做半透明背景），上面字幕和「跳过」（不跟着变淡）
-            root = new Grid { Background = Brushes.Transparent };
+            root = new Grid { Background = Brushes.Transparent, HorizontalAlignment = HorizontalAlignment.Left, VerticalAlignment = VerticalAlignment.Top }; // 位置大小由 PlaceContent 按 Claude 窗口定
             root.Children.Add(grid);
             overlay = new Window
             {
@@ -556,6 +587,15 @@ namespace ClaudeBootAnimation
 
         IntPtr WndProc(IntPtr h, int msg, IntPtr wParam, IntPtr lParam, ref bool handled)
         {
+            if (msg == 0x02E0 /*WM_DPICHANGED*/)
+            {
+                // 浮层换到另一块缩放不同的屏（#7：主屏 150%、副屏 125%）：WPF 可能按系统建议改掉浮层大小，
+                // 等它处理完，再按新缩放把浮层铺回整块屏、把视频摆回窗口位置，免得背景变小或错位到窗口再动一下才好
+                int dpi = (int)(wParam.ToInt64() & 0xFFFF);
+                Log.W("浮层换到缩放 " + (dpi * 100 / 96) + "% 的屏，重新摆放");
+                overlay.Dispatcher.BeginInvoke(new Action(delegate { if (phase != Phase.Done) Follow(true); }));
+                return IntPtr.Zero;
+            }
             if (msg != 0x218 /*WM_POWERBROADCAST*/) return IntPtr.Zero;
             try
             {
@@ -694,7 +734,7 @@ namespace ClaudeBootAnimation
         // 每帧检查重叠交接（只在有 loop-x2.mp4 时）
         void CheckHandoff()
         {
-            if (!overlapLoop || phase == Phase.Done || !introGone || swapFrom != null || activeLoop == null) return;
+            if (paused || !overlapLoop || phase == Phase.Done || !introGone || swapFrom != null || activeLoop == null) return;
             if (handFrom != null && handFrom != activeLoop) { handFrom = null; handTo = null; } // 被重建 / 老办法接走了
             var cur = activeLoop;
             if (!cur.NaturalDuration.HasTimeSpan) return;
@@ -789,7 +829,7 @@ namespace ClaudeBootAnimation
 
         void CheckRetire(long now)
         {
-            if (retiring == null) return;
+            if (retiring == null || paused) return;
             // 新播放器稳稳走过 1 秒才撤旧画面，而且 0.25 秒淡出、不是一下拿掉。
             // 云端实测：新播放器进度刚过 0.3 秒时画面还会黑一两帧，那时撤掉旧画面就闪黑；以前 2.5 秒没动也照撤，撤完是一块空白
             if (activeLoop.Position.TotalSeconds < 1.0 && now - retireT0 < 20000) return;
@@ -806,9 +846,9 @@ namespace ClaudeBootAnimation
             nextSampleMs = now + 250;
             bool timerGap = lastSampleMs > 0 && now - lastSampleMs > 2000; // 电脑睡眠、整个程序卡住时计时器没跑，那段不算画面卡住
             lastSampleMs = now;
-            if (timerGap || phase != Phase.Revealed || !introGone || hidden || activeLoop == null)
+            if (timerGap || paused || phase != Phase.Revealed || !introGone || hidden || activeLoop == null)
             {
-                lastMoveMs = now; lastPos = -1; // 藏着、还在开屏时不算；回来后重新计时
+                lastMoveMs = now; lastPos = -1; // 藏着、暂停着、还在开屏时不算；回来后重新计时
                 return;
             }
             double p = activeLoop.Position.TotalSeconds;
@@ -843,7 +883,7 @@ namespace ClaudeBootAnimation
         /// 开发用：提前换播放器（--loop-cut）、故意制造卡住（--stall-test）
         void DevHooks(long now)
         {
-            if (phase != Phase.Revealed || !introGone || activeLoop == null) return;
+            if (paused || phase != Phase.Revealed || !introGone || activeLoop == null) return;
             if (Dev.LoopCutSec > 0 && !overlapLoop && swapFrom == null && activeLoop.Position.TotalSeconds >= Dev.LoopCutSec)
                 SwapLoop(activeLoop, OtherLoop(activeLoop));
             if (Dev.StallTestSec > 0 && now >= nextStallTestMs)
@@ -883,7 +923,7 @@ namespace ClaudeBootAnimation
             long now = clock.ElapsedMilliseconds;
             CheckRetire(now);
             DevHooks(now);
-            if (pendingAt > 0 && now >= pendingAt && !hidden && phase == Phase.Revealed && introGone)
+            if (pendingAt > 0 && now >= pendingAt && !hidden && !paused && phase == Phase.Revealed && introGone) // 暂停时先不重建，继续播放后再补
             {
                 pendingAt = RebuildLoops(pendingWhy) ? 0 : now + 1000; // 被退避挡住就过一秒再问
             }
@@ -932,11 +972,55 @@ namespace ClaudeBootAnimation
             }
             Native.RECT r;
             if (!Native.Bounds(Target.Hwnd, out r)) return;
-            if (!force && r.Left == lastRect.Left && r.Top == lastRect.Top && r.Right == lastRect.Right && r.Bottom == lastRect.Bottom) return;
+            // 浮层被改了大小（换到缩放不同的屏时 WPF 可能按系统建议改它），或浮层所在屏的缩放变了：强制重摆一次（#7）。
+            // 不只靠 WM_DPICHANGED：实测单屏改缩放时那条消息没到我们这里
+            if (!force && overlayH != IntPtr.Zero && overlayBox.Right > overlayBox.Left)
+            {
+                Native.RECT cur;
+                double sc = CurrentScale();
+                bool moved = Native.GetWindowRect(overlayH, out cur) && !SameRect(cur, overlayBox);
+                if (moved || Math.Abs(sc - placedScale) > 0.001)
+                {
+                    Log.W("浮层" + (moved ? "大小被改动" : "所在屏缩放变了") + "，按 " + Math.Round(100 / sc) + "% 重新摆放");
+                    force = true;
+                }
+            }
+            if (!force && SameRect(r, lastRect)) return;
             lastRect = r;
-            uint f = Native.SWP_NOZORDER | Native.SWP_NOACTIVATE | Native.SWP_NOOWNERZORDER;
-            if (overlayH != IntPtr.Zero) Native.SetWindowPos(overlayH, IntPtr.Zero, r.Left, r.Top, r.Right - r.Left, r.Bottom - r.Top, f);
-            if (topH != IntPtr.Zero) Native.SetWindowPos(topH, IntPtr.Zero, r.Left, r.Top, r.Right - r.Left, r.Bottom - r.Top, f);
+            // 浮层窗口铺满 Claude 所在的整块屏（Claude 伸出屏幕的部分也包进来），视频那块再挪到 Claude 窗口的位置。
+            // 以前浮层跟着 Claude 一起改大小：分层窗口每次改大小都要整块重画，还原窗口时背景会消失 0.15～0.3 秒，深色界面上看着就是闪黑（#6）。
+            // 现在还原、最大化、拉边框只是挪里面的内容，窗口本身只在换到另一块屏、或 Claude 伸出屏幕时才改大小
+            Native.RECT box;
+            if (!Native.MonitorRect(Target.Hwnd, out box)) box = r;
+            box = new Native.RECT { Left = Math.Min(box.Left, r.Left), Top = Math.Min(box.Top, r.Top), Right = Math.Max(box.Right, r.Right), Bottom = Math.Max(box.Bottom, r.Bottom) };
+            if (force || !SameRect(box, overlayBox))
+            {
+                overlayBox = box;
+                uint f = Native.SWP_NOZORDER | Native.SWP_NOACTIVATE | Native.SWP_NOOWNERZORDER;
+                if (overlayH != IntPtr.Zero) Native.SetWindowPos(overlayH, IntPtr.Zero, box.Left, box.Top, box.Right - box.Left, box.Bottom - box.Top, f);
+                if (topH != IntPtr.Zero) Native.SetWindowPos(topH, IntPtr.Zero, box.Left, box.Top, box.Right - box.Left, box.Bottom - box.Top, f);
+            }
+            PlaceContent(r, box);
+        }
+
+        Native.RECT overlayBox;
+        double placedScale = 1;
+        double CurrentScale()
+        {
+            var src = PresentationSource.FromVisual(overlay);
+            return src != null && src.CompositionTarget != null ? src.CompositionTarget.TransformFromDevice.M11 : 1;
+        }
+        static bool SameRect(Native.RECT a, Native.RECT b) { return a.Left == b.Left && a.Top == b.Top && a.Right == b.Right && a.Bottom == b.Bottom; }
+
+        /// 把视频、字幕、「跳过」那一层摆到 Claude 窗口在浮层里的位置（物理像素换成 WPF 的逻辑单位）
+        void PlaceContent(Native.RECT r, Native.RECT box)
+        {
+            var src = PresentationSource.FromVisual(overlay);
+            Matrix m = src != null && src.CompositionTarget != null ? src.CompositionTarget.TransformFromDevice : Matrix.Identity;
+            placedScale = m.M11;
+            root.Margin = new Thickness((r.Left - box.Left) * m.M11, (r.Top - box.Top) * m.M22, 0, 0);
+            root.Width = Math.Max(1, (r.Right - r.Left) * m.M11);
+            root.Height = Math.Max(1, (r.Bottom - r.Top) * m.M22);
         }
 
         void ShowAll(bool show)
@@ -1086,6 +1170,34 @@ namespace ClaudeBootAnimation
         }
 
         public bool Active { get { return phase != Phase.Done; } }
+        /// 正在放开屏或循环背景（不算正在淡出关掉）
+        public bool Playing { get { return phase == Phase.Intro || phase == Phase.Revealed; } }
+        public bool InIntro { get { return phase == Phase.Intro; } }
+        public bool CanPause { get { return phase == Phase.Revealed; } }
+
+        // ── 暂停循环背景：画面停在当前这一帧，背景照样盖着；再点继续 ──
+        bool paused;
+        public bool Paused { get { return paused; } }
+        public void SetPaused(bool p)
+        {
+            if (phase != Phase.Revealed || p == paused) return;
+            if (p)
+            {
+                if (swapFrom != null) FinishSwap();   // 正在接缝：先接完
+                if (handTo != null) { handTo.Pause(); handTo.Position = TimeSpan.Zero; handFrom = null; handTo = null; } // 正在重叠交接：新的退回待命
+                foreach (var m in new[] { intro, loopA, loopB })
+                    if (m != null) { try { m.Pause(); } catch { } }
+                paused = true;
+            }
+            else
+            {
+                paused = false;
+                if (!introGone && intro != null) intro.Play();
+                else if (activeLoop != null) activeLoop.Play();
+                lastMoveMs = clock.ElapsedMilliseconds; lastPos = -1; // 卡住检测从现在重新算
+            }
+            Log.W(p ? "暂停循环背景" : "继续播放循环背景");
+        }
 
         /// 测试用：把 Claude 窗口那块屏幕截下来
         public void Snapshot(string path)
@@ -1205,7 +1317,7 @@ namespace ClaudeBootAnimation
         public Config Config;
         Show show;
         WF.NotifyIcon tray;
-        WF.ToolStripMenuItem introItem, loopItem, stopItem;
+        WF.ToolStripMenuItem introItem, loopItem, loopNowItem, pauseItem;
         WF.ToolStripLabel alphaLabel, volLabel;
         WF.TrackBar alphaBar, volBar;
         SettingsWindow settings;
@@ -1241,7 +1353,7 @@ namespace ClaudeBootAnimation
             Dev.StallTestSec = ArgD("--stall-test", Dev.StallTestSec);
             Dev.RecycleEvery = (int)ArgD("--recycle-every", Dev.RecycleEvery);
             Dev.HeartbeatSec = ArgD("--heartbeat", Dev.HeartbeatSec);
-            Log.W("启动 " + string.Join(" ", args) + "  程序目录 " + AppDomain.CurrentDomain.BaseDirectory);
+            Log.W("启动 " + string.Join(" ", args) + "  程序目录 " + AppDomain.CurrentDomain.BaseDirectory + "  缩放模式 " + Program.DpiMode);
 
             if (Arg("--render-subtitle") != null) { RenderSubtitleTest(); return; }
 
@@ -1313,6 +1425,7 @@ namespace ClaudeBootAnimation
         public void PreviewIntro() { StartOnCurrent(true); }
         public void PreviewLoop() { StartOnCurrent(false); }
         public void StopShow() { if (show != null) show.Finish(true); }
+        public void ToggleLoopNow() { if (show != null && show.Playing) show.Finish(true); else PreviewLoop(); }
         public void OpenConfig() { Config.Save(); try { Process.Start("notepad.exe", "\"" + Config.FilePath + "\""); } catch { } }
 
         public void Update(Action<Config> change, object from)
@@ -1412,10 +1525,13 @@ namespace ClaudeBootAnimation
 
             m.Items.Add(new WF.ToolStripLabel("现在，在 Claude 窗口上") { Enabled = false });
             m.Items.Add("播放一次开屏动画", null, delegate { PreviewIntro(); });
-            m.Items.Add("开启循环背景", null, delegate { PreviewLoop(); });
-            stopItem = new WF.ToolStripMenuItem("关掉动画 / 背景");
-            stopItem.Click += delegate { StopShow(); };
-            m.Items.Add(stopItem);
+            // 一个键开关：开着背景时是「关掉循环背景」，没开时是「开启循环背景」（文字在 RefreshMenu 里换）
+            loopNowItem = new WF.ToolStripMenuItem("开启循环背景");
+            loopNowItem.Click += delegate { ToggleLoopNow(); };
+            m.Items.Add(loopNowItem);
+            pauseItem = new WF.ToolStripMenuItem("暂停循环背景");
+            pauseItem.Click += delegate { if (show != null) show.SetPaused(!show.Paused); };
+            m.Items.Add(pauseItem);
             m.Items.Add(new WF.ToolStripSeparator());
             m.Items.Add("设置窗口…", null, delegate { OpenSettings(); });
             m.Items.Add("打开设置文件…", null, delegate { OpenConfig(); });
@@ -1437,7 +1553,10 @@ namespace ClaudeBootAnimation
             menuLoading = true;
             introItem.Checked = Config.PlayIntro;
             loopItem.Checked = Config.LoopBackground;
-            stopItem.Enabled = show != null;
+            bool playing = show != null && show.Playing;
+            loopNowItem.Text = !playing ? "开启循环背景" : show.InIntro ? "关掉开屏动画" : "关掉循环背景";
+            pauseItem.Text = playing && show.Paused ? "继续播放循环背景" : "暂停循环背景";
+            pauseItem.Enabled = playing && show.CanPause;
             alphaBar.Value = Math.Max(0, Math.Min(80, (int)Math.Round(Config.ResidualAlpha * 100)));
             volBar.Value = Math.Max(0, Math.Min(100, (int)Math.Round(Config.IntroVolume * 100)));
             alphaLabel.Text = "背景不透明度  " + alphaBar.Value + "%";
@@ -1539,10 +1658,20 @@ namespace ClaudeBootAnimation
 
     public static class Program
     {
+        public static string DpiMode = "";
         [STAThread]
         public static int Main(string[] args)
         {
-            Native.SetProcessDPIAware();
+            // 缩放模式必须在最前面、在任何 WPF 类型被碰到之前定下来：
+            // 系统准备一个函数时会先把它用到的类型都加载好，WPF 一加载就把进程定成「只认登录时缩放」，之后再设就被拒了。
+            // 所以这里只做这一件事，其余的放到单独的 Run 里
+            DpiMode = Native.UseDpiAwareness();
+            return Run(args);
+        }
+
+        [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
+        static int Run(string[] args)
+        {
             GpuPref.Ensure();   // 要在 WPF 建立显卡渲染之前设好
             bool test = Array.IndexOf(args, "--target-title") >= 0 || Array.IndexOf(args, "--render-subtitle") >= 0;
             Mutex mutex = null;
