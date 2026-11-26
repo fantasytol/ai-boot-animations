@@ -84,13 +84,21 @@ jobs:
           $app = Start-Process build\GPTBootAnimation.exe -PassThru -ArgumentList "--target-title Notepad --play intro --test-skip 3 --exit-after 8 --shot-at 2.5,3.4,4.5,7 --shot-dir `"$pwd\out\skip`"" 
           $app | Wait-Process -Timeout 60 -ErrorAction SilentlyContinue; $app | Stop-Process -Force -ErrorAction SilentlyContinue
           Stop-Process $np -Force
-      - name: 只开循环背景
+      - name: 只开循环背景（检查：浮层确实是分层窗口、点击能穿透到下面的窗口）
         run: |
+          $log = "$env:LOCALAPPDATA\GPTBootAnimation\log.txt"
+          $before = @(Get-Content $log -Encoding UTF8 -ErrorAction SilentlyContinue).Count
           $np = Start-Process notepad -WindowStyle Maximized -PassThru
           Start-Sleep 3
           $app = Start-Process build\GPTBootAnimation.exe -PassThru -ArgumentList "--target-title Notepad --play loop --exit-after 14 --shot-at 2,6,12 --shot-dir `"$pwd\out\loop`"" 
           $app | Wait-Process -Timeout 60 -ErrorAction SilentlyContinue; $app | Stop-Process -Force -ErrorAction SilentlyContinue
           Stop-Process $np -Force
+          $new = @(@(Get-Content $log -Encoding UTF8 -ErrorAction SilentlyContinue) | Select-Object -Skip $before)
+          $new | ForEach-Object { Write-Host $_ }
+          if (-not ($new | Where-Object { $_.Contains('layered=1') })) { throw "overlay is not a layered window" }
+          $hits = @($new | Where-Object { $_.Contains(' hit=') })
+          if ($hits.Count -eq 0) { throw "no snapshot hit-test lines" }
+          if ($hits | Where-Object { -not $_.Contains('hit=target') }) { throw "click does not pass through to the target window" }
       - name: 循环背景卡住后自愈（每 0.8 秒强制接缝，每 10 秒故意卡一次）
         run: |
           $log = "$env:LOCALAPPDATA\GPTBootAnimation\log.txt"
@@ -150,13 +158,20 @@ jobs:
             Remove-Item out\seam\$mode.mp4 -ErrorAction SilentlyContinue   # 录屏不推到仓库，只留数据
           }
           if (Test-Path $cfgBak) { Move-Item $cfgBak "$cfgDir\config.json" -Force } else { Remove-Item "$cfgDir\config.json" -ErrorAction SilentlyContinue }
-      - name: 性能对比（老的逐像素透明浮层 vs 新的整窗透明浮层；云端没有显卡，是软件渲染，只看相对差别）
+      - name: 性能对比（老的逐像素透明 / 新的外壳窗口 / 完全不透明的下限；云端没有显卡、是软件渲染，CPU 只能看相对差别；截图亮度要对得上）
         run: |
           $log = "$env:LOCALAPPDATA\GPTBootAnimation\log.txt"
           New-Item -ItemType Directory -Force out\perf | Out-Null
           # 「性能：」用码位拼，免得脚本编码出岔子
           $tag = [string]::Concat([char[]](0x6027,0x80FD,0xFF1A))
-          foreach ($mode in @('perpixel', 'layered')) {
+          Add-Type -AssemblyName System.Drawing
+          function MeanY($path) {
+            $img = [Drawing.Bitmap]::FromFile($path); $sum = 0; $n = 0
+            for ($y = 0; $y -lt $img.Height; $y += 8) { for ($x = 0; $x -lt $img.Width; $x += 8) { $c = $img.GetPixel($x, $y); $sum += 0.299 * $c.R + 0.587 * $c.G + 0.114 * $c.B; $n++ } }
+            $img.Dispose(); return $sum / $n
+          }
+          $bright = @{}
+          foreach ($mode in @('perpixel', 'hosted', 'opaque')) {
             $before = @(Get-Content $log -Encoding UTF8 -ErrorAction SilentlyContinue).Count
             $np = Start-Process notepad -WindowStyle Maximized -PassThru
             Start-Sleep 3
@@ -166,7 +181,14 @@ jobs:
             $new = @(@(Get-Content $log -Encoding UTF8 -ErrorAction SilentlyContinue) | Select-Object -Skip $before)
             "[$mode]" | Tee-Object -Append out\perf\summary.txt
             $new | Where-Object { $_.Contains($tag) } | Tee-Object -Append out\perf\summary.txt
+            $shot = Get-ChildItem "out\perf\$mode" -Filter *.png -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($shot) { $bright[$mode] = MeanY $shot.FullName; ("[$mode] screenshot mean brightness {0:N1}" -f $bright[$mode]) | Tee-Object -Append out\perf\summary.txt }
           }
+          # 新浮层在默认 25% 透明度下，看上去要和老浮层一样（差太多说明透明没生效，比如整块不透明）
+          if (-not $bright.ContainsKey('perpixel') -or -not $bright.ContainsKey('hosted')) { throw "missing perf screenshots" }
+          $d = [Math]::Abs($bright['hosted'] - $bright['perpixel'])
+          ("hosted vs perpixel brightness diff {0:N1}" -f $d) | Tee-Object -Append out\perf\summary.txt
+          if ($d -gt 12) { throw "hosted overlay does not look like the per-pixel one (alpha not applied?)" }
       - name: 还原 / 最大化切换时有没有闪（#6 回归；只看还原后窗口里面那一块）
         run: |
           $env:Path += ";C:\ProgramData\chocolatey\bin"
@@ -176,7 +198,7 @@ jobs:
           $cfgBak = "$cfgDir\config.json.bak2"
           if (Test-Path "$cfgDir\config.json") { Copy-Item "$cfgDir\config.json" $cfgBak -Force }
           Set-Content "$cfgDir\config.json" '{ "residualAlpha" : 1.0 }' -Encoding UTF8
-          foreach ($mode in @('perpixel', 'layered')) {
+          foreach ($mode in @('perpixel', 'hosted')) {
             $np = Start-Process notepad -PassThru
             Start-Sleep 2
             $np.Refresh(); $h = $np.MainWindowHandle
@@ -192,16 +214,21 @@ jobs:
             $app | Wait-Process -Timeout 60 -ErrorAction SilentlyContinue; $app | Stop-Process -Force -ErrorAction SilentlyContinue
             Stop-Process $np -Force -ErrorAction SilentlyContinue
             ffmpeg -v error -i out\resize\$mode.mp4 -vf "signalstats,metadata=print:key=lavfi.signalstats.YAVG:file=out/resize/$mode-yavg.txt" -f null -
-            $t = $null; $prev = $null; $rows = @()
+            # 最大化 / 还原时画面本来就会在两个亮度之间切换（窗口里露出的视频区域不同），那不算闪。
+            # 只抓离这两个正常亮度都很远的帧（闪黑会掉到很暗，露出记事本白底会很亮）
+            $ts = @(); $ys = @()
             foreach ($line in Get-Content "out\resize\$mode-yavg.txt") {
-              if ($line -match 'pts_time:([0-9.]+)') { $t = [double]$matches[1] }
-              elseif ($line -match 'YAVG=([0-9.]+)') {
-                $y = [double]$matches[1]
-                if ($prev -ne $null -and [Math]::Abs($y - $prev) -gt 3) { $rows += ('t={0:N3}s  {1:N1} -> {2:N1}' -f $t, $prev, $y) }
-                $prev = $y
-              }
+              if ($line -match 'pts_time:([0-9.]+)') { $ts += [double]$matches[1] }
+              elseif ($line -match 'YAVG=([0-9.]+)') { $ys += [double]$matches[1] }
             }
-            "[$mode] resize: frames with brightness jump > 3: $($rows.Count)" | Tee-Object -Append out\resize\summary.txt
+            $sorted = $ys | Sort-Object
+            $lo = $sorted[[int]($sorted.Count * 0.15)]; $hi = $sorted[[int]($sorted.Count * 0.85)]
+            $rows = @()
+            for ($i = 0; $i -lt $ys.Count; $i++) {
+              $dist = [Math]::Min([Math]::Abs($ys[$i] - $lo), [Math]::Abs($ys[$i] - $hi))
+              if ($ys[$i] -lt $lo - 15 -or $ys[$i] -gt $hi + 15) { $rows += ('t={0:N3}s  Y={1:N1}  (normal {2:N1} / {3:N1})' -f $ts[$i], $ys[$i], $lo, $hi) }
+            }
+            "[$mode] resize: frames far outside normal brightness: $($rows.Count) of $($ys.Count)" | Tee-Object -Append out\resize\summary.txt
             $rows | Select-Object -First 40 | Tee-Object -Append out\resize\summary.txt
             Remove-Item out\resize\$mode.mp4 -ErrorAction SilentlyContinue
           }

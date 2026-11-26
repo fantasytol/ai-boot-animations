@@ -411,7 +411,11 @@ namespace GPTBootAnimation
         public static int RecycleEvery = 10;    // --recycle-every 圈：每放这么多圈，把后台待命的播放器换成新的（0 = 不换）
         public static double HeartbeatSec = 600; // --heartbeat 秒：循环背景每隔多久往日志里报一次平安
         public static double PerfSec = 0;       // --perf-log 秒：每隔这么久往日志里记一次 CPU / 内存（测性能用）
-        public static bool PerPixel = false;    // --overlay-mode perpixel：用老的逐像素透明浮层（只为对比性能）
+        // --overlay-mode：浮层怎么做。hosted = 系统分层外壳窗口 + 里面嵌 WPF 画面（默认）；
+        // perpixel = 老的 WPF 逐像素透明窗口（只为对比性能）；opaque = 完全不透明（只为测性能下限，画面不对）
+        public static string OverlayMode = "hosted";
+        public static bool PerPixel { get { return OverlayMode == "perpixel"; } }
+        public static bool Hosted { get { return OverlayMode == "hosted"; } }
     }
 
     /// 本进程 CPU 占用：两次采样之间用掉的 CPU 时间 ÷ 经过的时间 ÷ 核数，跟任务管理器「CPU」那一列同一个算法
@@ -441,6 +445,42 @@ namespace GPTBootAnimation
 
     // ───────────────────────── 一次播放 ─────────────────────────
 
+    /// 浮层的外壳：系统自己的分层窗口，整窗透明度用 SetLayeredWindowAttributes 交给桌面合成器在显卡上混合；
+    /// WPF 画面嵌在里面当子窗口，照常用显卡画。
+    /// 不直接用 WPF 窗口：WPF 的窗口要半透明只能开逐像素透明（每帧把整块画面拷回内存、CPU 混合，#9 的 CPU 20%+ 就是它），
+    /// 自己给 WPF 窗口加分层样式又会被 WPF 当场拿掉
+    public class HostForm : WF.Form
+    {
+        public bool ClickThrough;
+        public delegate IntPtr MsgHook(IntPtr h, int msg, IntPtr w, IntPtr l, ref bool handled);
+        public MsgHook OnMsg;
+        public HostForm(string title)
+        {
+            FormBorderStyle = WF.FormBorderStyle.None; ShowInTaskbar = false; BackColor = SD.Color.Black;
+            StartPosition = WF.FormStartPosition.Manual; Location = new SD.Point(-32000, -32000); Size = new SD.Size(10, 10); Text = title;
+        }
+        protected override bool ShowWithoutActivation { get { return true; } }
+        protected override WF.CreateParams CreateParams
+        {
+            get
+            {
+                var cp = base.CreateParams;
+                cp.Style = unchecked((int)0x80000000) | 0x02000000;   // WS_POPUP | WS_CLIPCHILDREN
+                cp.ExStyle = (cp.ExStyle | 0x80000 /*LAYERED*/ | 0x80 /*TOOLWINDOW*/ | 0x8000000 /*NOACTIVATE*/ | (ClickThrough ? 0x20 : 0)) & ~0x40000 /*APPWINDOW*/;
+                return cp;
+            }
+        }
+        protected override void WndProc(ref WF.Message m)
+        {
+            if (OnMsg != null)
+            {
+                bool handled = false;
+                try { OnMsg(m.HWnd, m.Msg, m.WParam, m.LParam, ref handled); } catch (Exception ex) { Log.W("浮层消息处理出错：" + ex.Message); }
+            }
+            base.WndProc(ref m);
+        }
+    }
+
     public class Show
     {
         enum Phase { Intro, Revealed, Ending, Done }
@@ -453,6 +493,7 @@ namespace GPTBootAnimation
 
         Window overlay, top;
         IntPtr overlayH, topH;
+        HostForm host; HwndSource childSrc; IntPtr childH;   // hosted 模式：外壳窗口和里面的 WPF 画面
         Grid grid, root;
         int styleFixes;
         MediaElement intro, loopA, loopB, activeLoop;
@@ -531,32 +572,43 @@ namespace GPTBootAnimation
             // 一个窗口三层：最下面视频（整体调透明度做半透明背景），上面字幕和「跳过」（不跟着变淡）
             root = new Grid { Background = Brushes.Transparent, HorizontalAlignment = HorizontalAlignment.Left, VerticalAlignment = VerticalAlignment.Top }; // 位置大小由 PlaceContent 按 ChatGPT 窗口定
             root.Children.Add(grid);
-            overlay = new Window
-            {
-                // 浮层不再用逐像素透明（AllowsTransparency）：那种窗口每一帧都要把整块画面从显卡拷回内存、再用 CPU 混合一遍，
-                // 1080p 视频 30 帧就是 CPU 20%～30%（#9）。现在窗口本身不透明、交给显卡直接画，整窗半透明用系统的
-                // 「分层窗口整体透明度」（SetLayeredWindowAttributes）来做，由桌面合成器在显卡上混合，画质一点不变
-                WindowStyle = WindowStyle.None, AllowsTransparency = Dev.PerPixel, ResizeMode = ResizeMode.NoResize, ShowInTaskbar = false,
-                ShowActivated = false, Background = Dev.PerPixel ? Brushes.Transparent : Brushes.Black, Content = root,
-                Left = -32000, Top = -32000, Width = 10, Height = 10, Title = "GPT Boot Animation"
-            };
             clickThrough = !withIntro;
             alpha = 0; // 开屏也从透明淡入（0.3 秒），不再一出现就整块黑屏盖上去
             grid.Opacity = Dev.PerPixel ? alpha : 1;
-            waitFrame = !withIntro; // 直接开循环背景时，等视频出了第一帧再淡入（窗口不透明了，没出帧时是黑的）
-            overlay.SourceInitialized += delegate
+            waitFrame = !withIntro && !Dev.PerPixel; // 直接开循环背景时，等视频出了第一帧再淡入（外壳窗口是黑底，没出帧时是黑的）
+            disp = Dispatcher.CurrentDispatcher;
+            if (Dev.Hosted)
             {
-                overlayH = new WindowInteropHelper(overlay).Handle;
-                EnsureOverlayStyle(true);
-                ApplyAlpha();
-                // 收系统的睡眠唤醒、显示器亮灭通知（这两种之后视频画面最容易冻住）
-                var hs = HwndSource.FromHwnd(overlayH);
-                if (hs != null) hs.AddHook(WndProc);
-                try { Guid g = Native.GUID_CONSOLE_DISPLAY_STATE; powerNotify = Native.RegisterPowerSettingNotification(overlayH, ref g, 0); }
-                catch (Exception ex) { Log.W("显示器亮灭通知注册失败：" + ex.Message); }
-                // 设成 ChatGPT 窗口的「附属窗口」：系统自动让它一直在 ChatGPT 上面，ChatGPT 被别的窗口挡住时它也一起被挡住
-                Native.SetLong(overlayH, Native.GWLP_HWNDPARENT, Target.Hwnd.ToInt64());
-            };
+                host = new HostForm("GPT Boot Animation") { ClickThrough = clickThrough };
+                host.OnMsg = WndProc;
+                overlayH = host.Handle;          // 这一步建出窗口
+                ApplyAlpha(true);                // 分层窗口建好后先设成全透明，不然在设之前是看不见也点不到的状态
+                InitOverlayHandle();
+                childSrc = new HwndSource(new HwndSourceParameters("GPT Boot Animation")
+                {
+                    ParentWindow = overlayH, WindowStyle = 0x50000000 /*WS_CHILD | WS_VISIBLE*/, PositionX = 0, PositionY = 0, Width = 10, Height = 10
+                });
+                childSrc.CompositionTarget.BackgroundColor = Colors.Black;
+                childSrc.RootVisual = root;
+                childH = childSrc.Handle;
+            }
+            else
+            {
+                overlay = new Window
+                {
+                    WindowStyle = WindowStyle.None, AllowsTransparency = Dev.PerPixel, ResizeMode = ResizeMode.NoResize, ShowInTaskbar = false,
+                    ShowActivated = false, Background = Dev.PerPixel ? Brushes.Transparent : Brushes.Black, Content = root,
+                    Left = -32000, Top = -32000, Width = 10, Height = 10, Title = "GPT Boot Animation"
+                };
+                overlay.SourceInitialized += delegate
+                {
+                    overlayH = new WindowInteropHelper(overlay).Handle;
+                    EnsureOverlayStyle(true);
+                    var hs = HwndSource.FromHwnd(overlayH);
+                    if (hs != null) hs.AddHook(WndProc);
+                    InitOverlayHandle();
+                };
+            }
 
             if (withIntro)
             {
@@ -582,11 +634,12 @@ namespace GPTBootAnimation
                 topGrid.Children.Add(skipBtn);
             }
 
-            overlay.Show();
+            if (host != null) host.Show(); else overlay.Show();
             EnsureOverlayStyle(true); // WPF 显示窗口时会重写扩展样式，显示后再补一次
             if (top != null) top.Show();
             Follow(true);
-            Log.W("浮层样式 0x" + Native.GetLong(overlayH, Native.GWL_EXSTYLE).ToString("X"));
+            long st = Native.GetLong(overlayH, Native.GWL_EXSTYLE);
+            Log.W("浮层样式 0x" + st.ToString("X") + " layered=" + ((st & Native.WS_EX_LAYERED) != 0 ? 1 : 0) + " mode=" + Dev.OverlayMode);
 
             if (withIntro)
             {
@@ -656,26 +709,24 @@ namespace GPTBootAnimation
             return Dev.LoopCutSec > 0;
         }
 
-        int styleBlocks;   // WPF 想拿掉分层样式、被我们拦下的次数
+        /// 浮层窗口建好后：收系统的睡眠唤醒、显示器亮灭通知（这两种之后视频画面最容易冻住），
+        /// 并设成目标窗口的「附属窗口」：系统自动让它一直在目标窗口上面，目标窗口被别的窗口挡住时它也一起被挡住
+        void InitOverlayHandle()
+        {
+            try { Guid g = Native.GUID_CONSOLE_DISPLAY_STATE; powerNotify = Native.RegisterPowerSettingNotification(overlayH, ref g, 0); }
+            catch (Exception ex) { Log.W("显示器亮灭通知注册失败：" + ex.Message); }
+            Native.SetLong(overlayH, Native.GWLP_HWNDPARENT, Target.Hwnd.ToInt64());
+        }
+
         IntPtr WndProc(IntPtr h, int msg, IntPtr wParam, IntPtr lParam, ref bool handled)
         {
-            if (msg == 0x007C /*WM_STYLECHANGING*/ && (int)wParam.ToInt64() == Native.GWL_EXSTYLE && !Dev.PerPixel && lParam != IntPtr.Zero)
-            {
-                // WPF 自己记着一份窗口样式，时不时整份写回去，把我们加的「分层」冲掉：每冲一次窗口就会不透明一下、
-                // 再补回来时又全透明一下，看着就是闪。改样式之前系统会先问窗口，在这里把要的几位塞回去，就根本不会被冲掉
-                long nw = (uint)Marshal.ReadInt32(lParam, 4);   // STYLESTRUCT { styleOld, styleNew }
-                long want = (nw | Native.WS_EX_LAYERED | Native.WS_EX_TOOLWINDOW | Native.WS_EX_NOACTIVATE) & ~Native.WS_EX_APPWINDOW;
-                if (clickThrough) want |= Native.WS_EX_TRANSPARENT;
-                if (want != nw) { Marshal.WriteInt32(lParam, 4, unchecked((int)want)); styleBlocks++; }
-                return IntPtr.Zero;
-            }
             if (msg == 0x02E0 /*WM_DPICHANGED*/)
             {
                 // 浮层换到另一块缩放不同的屏（#7：主屏 150%、副屏 125%）：WPF 可能按系统建议改掉浮层大小，
                 // 等它处理完，再按新缩放把浮层铺回整块屏、把视频摆回窗口位置，免得背景变小或错位到窗口再动一下才好
                 int dpi = (int)(wParam.ToInt64() & 0xFFFF);
                 Log.W("浮层换到缩放 " + (dpi * 100 / 96) + "% 的屏，重新摆放");
-                overlay.Dispatcher.BeginInvoke(new Action(delegate { if (phase != Phase.Done) Follow(true); }));
+                disp.BeginInvoke(new Action(delegate { if (phase != Phase.Done) Follow(true); }));
                 return IntPtr.Zero;
             }
             if (msg != 0x218 /*WM_POWERBROADCAST*/) return IntPtr.Zero;
@@ -1086,16 +1137,18 @@ namespace GPTBootAnimation
                 overlayBox = box;
                 uint f = Native.SWP_NOZORDER | Native.SWP_NOACTIVATE | Native.SWP_NOOWNERZORDER;
                 if (overlayH != IntPtr.Zero) Native.SetWindowPos(overlayH, IntPtr.Zero, box.Left, box.Top, box.Right - box.Left, box.Bottom - box.Top, f);
+                if (childH != IntPtr.Zero) Native.SetWindowPos(childH, IntPtr.Zero, 0, 0, box.Right - box.Left, box.Bottom - box.Top, f);
                 if (topH != IntPtr.Zero) Native.SetWindowPos(topH, IntPtr.Zero, box.Left, box.Top, box.Right - box.Left, box.Bottom - box.Top, f);
             }
             PlaceContent(r, box);
         }
 
         Native.RECT overlayBox;
+        PresentationSource Src() { return childSrc != null ? (PresentationSource)childSrc : PresentationSource.FromVisual(overlay); }
         double placedScale = 1;
         double CurrentScale()
         {
-            var src = PresentationSource.FromVisual(overlay);
+            var src = Src();
             return src != null && src.CompositionTarget != null ? src.CompositionTarget.TransformFromDevice.M11 : 1;
         }
         static bool SameRect(Native.RECT a, Native.RECT b) { return a.Left == b.Left && a.Top == b.Top && a.Right == b.Right && a.Bottom == b.Bottom; }
@@ -1103,7 +1156,7 @@ namespace GPTBootAnimation
         /// 把视频、字幕、「跳过」那一层摆到 ChatGPT 窗口在浮层里的位置（物理像素换成 WPF 的逻辑单位）
         void PlaceContent(Native.RECT r, Native.RECT box)
         {
-            var src = PresentationSource.FromVisual(overlay);
+            var src = Src();
             Matrix m = src != null && src.CompositionTarget != null ? src.CompositionTarget.TransformFromDevice : Matrix.Identity;
             placedScale = m.M11;
             root.Margin = new Thickness((r.Left - box.Left) * m.M11, (r.Top - box.Top) * m.M22, 0, 0);
@@ -1123,13 +1176,14 @@ namespace GPTBootAnimation
         {
             if (overlayH == IntPtr.Zero) return;
             long ex = Native.GetLong(overlayH, Native.GWL_EXSTYLE);
-            long want = (ex | Native.WS_EX_TOOLWINDOW | Native.WS_EX_NOACTIVATE | Native.WS_EX_LAYERED) & ~Native.WS_EX_APPWINDOW;
+            long want = (ex | Native.WS_EX_TOOLWINDOW | Native.WS_EX_NOACTIVATE) & ~Native.WS_EX_APPWINDOW;
+            if (Dev.Hosted) want |= Native.WS_EX_LAYERED;
             if (clickThrough) want |= Native.WS_EX_TRANSPARENT;
-            if (want != ex && (styleFixes < 20 || (ex & Native.WS_EX_LAYERED) == 0))
+            if (want != ex && (styleFixes < 20 || (Dev.Hosted && (ex & Native.WS_EX_LAYERED) == 0)))
             {
                 if (!force) { styleFixes++; if (styleFixes <= 20) Log.W("浮层样式被改过，已补回 0x" + ex.ToString("X") + " → 0x" + want.ToString("X")); }
                 Native.SetLong(overlayH, Native.GWL_EXSTYLE, want);
-                if ((ex & Native.WS_EX_LAYERED) == 0) ApplyAlpha(true); // 分层样式被拿掉又补上后，透明度要重新告诉系统，不然整个窗口看不见
+                if (Dev.Hosted && (ex & Native.WS_EX_LAYERED) == 0) ApplyAlpha(true); // 分层样式被拿掉又补上后，透明度要重新告诉系统，不然整个窗口看不见
             }
         }
 
@@ -1144,7 +1198,7 @@ namespace GPTBootAnimation
         void ApplyAlpha(bool always)
         {
             if (Dev.PerPixel) { grid.Opacity = alpha; return; }
-            if (overlayH == IntPtr.Zero) return;
+            if (!Dev.Hosted || overlayH == IntPtr.Zero) return;   // opaque 模式只测性能，不做透明
             int b = (int)Math.Round((waitFrame ? 0 : alpha) * 255);
             if (b == appliedAlpha && !always) return;
             appliedAlpha = b;
@@ -1267,8 +1321,14 @@ namespace GPTBootAnimation
             foreach (var m in new[] { intro, loopA, loopB, retiring })
                 if (m != null) { try { m.Stop(); m.Close(); } catch { } }
             CloseTop();
-            try { overlay.Close(); } catch { }
-            Log.W("播放结束" + (styleBlocks > 0 ? "（拦下 WPF 改浮层样式 " + styleBlocks + " 次）" : ""));
+            try
+            {
+                if (childSrc != null) { childSrc.RootVisual = null; childSrc.Dispose(); childSrc = null; }
+                if (host != null) { host.Close(); host.Dispose(); }
+                if (overlay != null) overlay.Close();
+            }
+            catch (Exception ex) { Log.W("关浮层出错：" + ex.Message); }
+            Log.W("播放结束");
             if (onDone != null) onDone();
         }
 
@@ -1322,7 +1382,7 @@ namespace GPTBootAnimation
             IntPtr hit = Native.WindowFromPoint(new Native.POINT { X = r.Left + w / 2, Y = r.Top + h / 2 });
             IntPtr root = Native.GetAncestor(hit, 2 /*GA_ROOT*/);
             string who = root == overlayH ? "浮层" : root == Target.Hwnd ? "目标窗口" : root == topH ? "字幕层" : ("其他 " + Native.ClassOf(root));
-            Log.W("截图 " + path + "  播放阶段=" + phase + " 透明度=" + alpha.ToString("0.00") + " 样式=0x" + Native.GetLong(overlayH, Native.GWL_EXSTYLE).ToString("X") + " 中心点击落到=" + who);
+            Log.W("截图 " + path + "  播放阶段=" + phase + " 透明度=" + alpha.ToString("0.00") + " 样式=0x" + Native.GetLong(overlayH, Native.GWL_EXSTYLE).ToString("X") + " 中心点击落到=" + who + " hit=" + (root == Target.Hwnd ? "target" : root == overlayH ? "overlay" : "other"));
         }
     }
 
@@ -1457,9 +1517,10 @@ namespace GPTBootAnimation
             Dev.RecycleEvery = (int)ArgD("--recycle-every", Dev.RecycleEvery);
             Dev.HeartbeatSec = ArgD("--heartbeat", Dev.HeartbeatSec);
             Dev.PerfSec = ArgD("--perf-log", Dev.PerfSec);
-            Dev.PerPixel = Arg("--overlay-mode") == "perpixel";
+            var om = Arg("--overlay-mode");
+            if (om == "perpixel" || om == "hosted" || om == "opaque") Dev.OverlayMode = om;
             Log.W("启动 " + string.Join(" ", args) + "  程序目录 " + AppDomain.CurrentDomain.BaseDirectory + "  缩放模式 " + Program.DpiMode
-                + "  显卡渲染等级 " + (RenderCapability.Tier >> 16) + "  浮层 " + (Dev.PerPixel ? "逐像素透明（老）" : "整窗透明（新）"));
+                + "  显卡渲染等级 " + (RenderCapability.Tier >> 16) + "  浮层 " + Dev.OverlayMode);
             if (Dev.PerfSec > 0)
             {
                 Perf.Sample();
