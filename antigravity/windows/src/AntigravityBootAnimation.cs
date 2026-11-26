@@ -1511,7 +1511,7 @@ namespace AntigravityBootAnimation
             Config = Config.Load();
             LoadFont();
             Finder.TestTitle = Arg("--target-title");
-            testMode = Finder.TestTitle != null;
+            testMode = Finder.TestTitle != null || Has("--bench"); // --bench：对着真正的目标程序跑一遍测试流程（测性能用），不找记事本
             Dev.LoopCutSec = ArgD("--loop-cut", Dev.LoopCutSec);
             Dev.StallTestSec = ArgD("--stall-test", Dev.StallTestSec);
             Dev.RecycleEvery = (int)ArgD("--recycle-every", Dev.RecycleEvery);
@@ -1852,7 +1852,7 @@ namespace AntigravityBootAnimation
         static int Run(string[] args)
         {
             GpuPref.Ensure();   // 要在 WPF 建立显卡渲染之前设好
-            bool test = Array.IndexOf(args, "--target-title") >= 0 || Array.IndexOf(args, "--render-subtitle") >= 0;
+            bool test = Array.IndexOf(args, "--target-title") >= 0 || Array.IndexOf(args, "--render-subtitle") >= 0 || Array.IndexOf(args, "--bench") >= 0;
             Mutex mutex = null;
             EventWaitHandle showEvent = null;
             if (!test)
