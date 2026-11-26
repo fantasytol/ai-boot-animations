@@ -656,8 +656,19 @@ namespace GPTBootAnimation
             return Dev.LoopCutSec > 0;
         }
 
+        int styleBlocks;   // WPF 想拿掉分层样式、被我们拦下的次数
         IntPtr WndProc(IntPtr h, int msg, IntPtr wParam, IntPtr lParam, ref bool handled)
         {
+            if (msg == 0x007C /*WM_STYLECHANGING*/ && (int)wParam.ToInt64() == Native.GWL_EXSTYLE && !Dev.PerPixel && lParam != IntPtr.Zero)
+            {
+                // WPF 自己记着一份窗口样式，时不时整份写回去，把我们加的「分层」冲掉：每冲一次窗口就会不透明一下、
+                // 再补回来时又全透明一下，看着就是闪。改样式之前系统会先问窗口，在这里把要的几位塞回去，就根本不会被冲掉
+                long nw = (uint)Marshal.ReadInt32(lParam, 4);   // STYLESTRUCT { styleOld, styleNew }
+                long want = (nw | Native.WS_EX_LAYERED | Native.WS_EX_TOOLWINDOW | Native.WS_EX_NOACTIVATE) & ~Native.WS_EX_APPWINDOW;
+                if (clickThrough) want |= Native.WS_EX_TRANSPARENT;
+                if (want != nw) { Marshal.WriteInt32(lParam, 4, unchecked((int)want)); styleBlocks++; }
+                return IntPtr.Zero;
+            }
             if (msg == 0x02E0 /*WM_DPICHANGED*/)
             {
                 // 浮层换到另一块缩放不同的屏（#7：主屏 150%、副屏 125%）：WPF 可能按系统建议改掉浮层大小，
@@ -1257,7 +1268,7 @@ namespace GPTBootAnimation
                 if (m != null) { try { m.Stop(); m.Close(); } catch { } }
             CloseTop();
             try { overlay.Close(); } catch { }
-            Log.W("播放结束");
+            Log.W("播放结束" + (styleBlocks > 0 ? "（拦下 WPF 改浮层样式 " + styleBlocks + " 次）" : ""));
             if (onDone != null) onDone();
         }
 

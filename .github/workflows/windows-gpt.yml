@@ -185,7 +185,7 @@ jobs:
             Start-Sleep 1
             $app = Start-Process build\GPTBootAnimation.exe -PassThru -ArgumentList "--target-title Notepad --play loop --exit-after 30 --overlay-mode $mode"
             Start-Sleep 5
-            $rec = Start-Process ffmpeg -PassThru -NoNewWindow -ArgumentList "-v error -y -f gdigrab -framerate 60 -offset_x 200 -offset_y 200 -video_size 800 500 -t 18 -i desktop -vf scale=320:-1 -c:v libx264 -preset ultrafast -crf 18 out\resize\$mode.mp4"
+            $rec = Start-Process ffmpeg -PassThru -NoNewWindow -ArgumentList "-v error -y -f gdigrab -framerate 60 -offset_x 200 -offset_y 200 -video_size 800x500 -t 18 -i desktop -vf scale=320:-1 -c:v libx264 -preset ultrafast -crf 18 out\resize\$mode.mp4"
             Start-Sleep 1
             for ($i = 0; $i -lt 8; $i++) { [U.W]::ShowWindow($h, 3) | Out-Null; Start-Sleep -Milliseconds 1000; [U.W]::ShowWindow($h, 9) | Out-Null; Start-Sleep -Milliseconds 1000 }
             $rec | Wait-Process -Timeout 60 -ErrorAction SilentlyContinue
