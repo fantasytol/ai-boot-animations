@@ -227,6 +227,9 @@ namespace GPTBootAnimation
         [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr h, IntPtr after, int x, int y, int cx, int cy, uint flags);
         [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int cmd);
         [DllImport("user32.dll")] public static extern bool SetLayeredWindowAttributes(IntPtr h, uint key, byte alpha, uint flags);
+        public delegate void WinEventProc(IntPtr hook, uint ev, IntPtr h, int idObject, int idChild, uint thread, uint time);
+        [DllImport("user32.dll")] public static extern IntPtr SetWinEventHook(uint evMin, uint evMax, IntPtr mod, WinEventProc proc, uint pid, uint tid, uint flags);
+        [DllImport("user32.dll")] public static extern bool UnhookWinEvent(IntPtr hook);
         [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
         [DllImport("user32.dll")] static extern bool SetProcessDpiAwarenessContext(IntPtr ctx);
         [DllImport("shcore.dll")] static extern int SetProcessDpiAwareness(int v);
@@ -407,6 +410,33 @@ namespace GPTBootAnimation
         public static int StallMs = 3000;       // 画面多久没动算卡住
         public static int RecycleEvery = 10;    // --recycle-every 圈：每放这么多圈，把后台待命的播放器换成新的（0 = 不换）
         public static double HeartbeatSec = 600; // --heartbeat 秒：循环背景每隔多久往日志里报一次平安
+        public static double PerfSec = 0;       // --perf-log 秒：每隔这么久往日志里记一次 CPU / 内存（测性能用）
+        public static bool PerPixel = false;    // --overlay-mode perpixel：用老的逐像素透明浮层（只为对比性能）
+    }
+
+    /// 本进程 CPU 占用：两次采样之间用掉的 CPU 时间 ÷ 经过的时间 ÷ 核数，跟任务管理器「CPU」那一列同一个算法
+    public static class Perf
+    {
+        static TimeSpan lastCpu; static DateTime lastWall;
+        public static string Sample()
+        {
+            try
+            {
+                using (var p = Process.GetCurrentProcess())
+                {
+                    var cpu = p.TotalProcessorTime; var now = DateTime.UtcNow;
+                    string pct = "";
+                    if (lastWall != DateTime.MinValue)
+                    {
+                        double wall = (now - lastWall).TotalMilliseconds;
+                        if (wall > 0) pct = (100.0 * (cpu - lastCpu).TotalMilliseconds / wall / Environment.ProcessorCount).ToString("0.0", CultureInfo.InvariantCulture) + "%";
+                    }
+                    lastCpu = cpu; lastWall = now;
+                    return "CPU " + (pct == "" ? "（首次采样）" : pct) + "，内存 " + (p.WorkingSet64 / 1048576) + "MB（私有 " + (p.PrivateMemorySize64 / 1048576) + "MB），句柄 " + p.HandleCount;
+                }
+            }
+            catch (Exception ex) { return "性能采样失败：" + ex.Message; }
+        }
     }
 
     // ───────────────────────── 一次播放 ─────────────────────────
@@ -503,17 +533,22 @@ namespace GPTBootAnimation
             root.Children.Add(grid);
             overlay = new Window
             {
-                WindowStyle = WindowStyle.None, AllowsTransparency = true, ResizeMode = ResizeMode.NoResize, ShowInTaskbar = false,
-                ShowActivated = false, Background = Brushes.Transparent, Content = root,
+                // 浮层不再用逐像素透明（AllowsTransparency）：那种窗口每一帧都要把整块画面从显卡拷回内存、再用 CPU 混合一遍，
+                // 1080p 视频 30 帧就是 CPU 20%～30%（#9）。现在窗口本身不透明、交给显卡直接画，整窗半透明用系统的
+                // 「分层窗口整体透明度」（SetLayeredWindowAttributes）来做，由桌面合成器在显卡上混合，画质一点不变
+                WindowStyle = WindowStyle.None, AllowsTransparency = Dev.PerPixel, ResizeMode = ResizeMode.NoResize, ShowInTaskbar = false,
+                ShowActivated = false, Background = Dev.PerPixel ? Brushes.Transparent : Brushes.Black, Content = root,
                 Left = -32000, Top = -32000, Width = 10, Height = 10, Title = "GPT Boot Animation"
             };
             clickThrough = !withIntro;
             alpha = 0; // 开屏也从透明淡入（0.3 秒），不再一出现就整块黑屏盖上去
-            grid.Opacity = alpha;
+            grid.Opacity = Dev.PerPixel ? alpha : 1;
+            waitFrame = !withIntro; // 直接开循环背景时，等视频出了第一帧再淡入（窗口不透明了，没出帧时是黑的）
             overlay.SourceInitialized += delegate
             {
                 overlayH = new WindowInteropHelper(overlay).Handle;
                 EnsureOverlayStyle(true);
+                ApplyAlpha();
                 // 收系统的睡眠唤醒、显示器亮灭通知（这两种之后视频画面最容易冻住）
                 var hs = HwndSource.FromHwnd(overlayH);
                 if (hs != null) hs.AddHook(WndProc);
@@ -581,9 +616,44 @@ namespace GPTBootAnimation
             nextBeatMs = (long)(Dev.HeartbeatSec * 1000);
             nextStallTestMs = (long)(Dev.StallTestSec * 1000);
 
+            // 跟窗口：不再每 15 毫秒去问一次窗口在哪，改成让系统在目标窗口移动、缩放、最小化、隐藏时通知我们，马上跟上
+            winEvent = OnWinEvent;
+            foreach (var rng in new[] { new uint[] { 0x0016, 0x0017 } /*最小化开始/结束*/, new uint[] { 0x8002, 0x8003 } /*显示/隐藏*/,
+                                      new uint[] { 0x800B, 0x800B } /*位置变了*/, new uint[] { 0x8017, 0x8018 } /*被系统藏起/放出*/ })
+            {
+                IntPtr hk = Native.SetWinEventHook(rng[0], rng[1], IntPtr.Zero, winEvent, Target.Pid, 0, 0 /*WINEVENT_OUTOFCONTEXT*/);
+                if (hk != IntPtr.Zero) hooks.Add(hk);
+            }
+            if (hooks.Count < 4) Log.W("窗口事件通知只挂上 " + hooks.Count + "/4 个，靠定时检查兜底");
+
+            // 定时器只做杂事（交接、自愈、渐变、字幕）：要掐时间的时候 15 毫秒一次，平时 100 毫秒一次
             tick = new DispatcherTimer(DispatcherPriority.Render) { Interval = TimeSpan.FromMilliseconds(15) };
             tick.Tick += delegate { Tick(); };
             tick.Start();
+        }
+
+        readonly List<IntPtr> hooks = new List<IntPtr>();
+        Native.WinEventProc winEvent;   // 留着引用，不然被回收后系统回调会崩
+        bool waitFrame;
+
+        void OnWinEvent(IntPtr hook, uint ev, IntPtr h, int idObject, int idChild, uint thread, uint time)
+        {
+            if (h != Target.Hwnd || idObject != 0 /*OBJID_WINDOW*/ || idChild != 0 || phase == Phase.Done) return;
+            try { Follow(false); } catch (Exception ex) { Log.W("跟随窗口出错：" + ex.Message); }
+        }
+
+        /// 现在是不是要掐时间：开屏、渐变、接缝、交接快到点、重建中——这些时候定时器跑快档
+        bool Busy()
+        {
+            if (!introGone || alphaDur >= 0 || volDur >= 0 || swapFrom != null || handTo != null || retiring != null || pendingAt > 0 || waitFrame) return true;
+            if (overlapLoop && activeLoop != null && !paused && activeLoop.NaturalDuration.HasTimeSpan)
+            {
+                double half = activeLoop.NaturalDuration.TimeSpan.TotalSeconds / 2, pos = activeLoop.Position.TotalSeconds;
+                if (pos >= half - handLead - 0.3) return true;
+            }
+            if (!overlapLoop && activeLoop != null && activeLoop.NaturalDuration.HasTimeSpan
+                && activeLoop.Position.TotalSeconds >= activeLoop.NaturalDuration.TimeSpan.TotalSeconds - 0.3) return true;
+            return Dev.LoopCutSec > 0;
         }
 
         IntPtr WndProc(IntPtr h, int msg, IntPtr wParam, IntPtr lParam, ref bool handled)
@@ -856,9 +926,7 @@ namespace GPTBootAnimation
             if (now >= nextBeatMs)
             {
                 nextBeatMs = now + (long)(Math.Max(1, Dev.HeartbeatSec) * 1000);
-                string mem = "";
-                try { using (var pr = Process.GetCurrentProcess()) mem = "，内存 " + (pr.WorkingSet64 / 1048576) + "MB，句柄 " + pr.HandleCount; } catch { }
-                Log.W("循环背景运行中：已循环 " + laps + " 圈，自动恢复 " + recoveries + " 次，进度 " + p.ToString("0.00", CultureInfo.InvariantCulture) + " 秒" + mem);
+                Log.W("循环背景运行中：已循环 " + laps + " 圈，自动恢复 " + recoveries + " 次，进度 " + p.ToString("0.00", CultureInfo.InvariantCulture) + " 秒，" + Perf.Sample());
             }
             if (Math.Abs(p - lastPos) > 0.0005)
             {
@@ -936,7 +1004,13 @@ namespace GPTBootAnimation
                 if (phase == Phase.Intro && t >= config.FadeStartSeconds) Reveal(false);
                 UpdateSubtitle(t);
             }
-            if (alphaDur >= 0)
+            if (waitFrame)
+            {
+                // 视频还没出第一帧：保持全透明、渐变先不开始计时
+                if (activeLoop != null && activeLoop.Position.TotalSeconds > 0.05) { waitFrame = false; alphaT0 = DateTime.Now; }
+                else alphaT0 = DateTime.Now;
+            }
+            if (alphaDur >= 0 && !waitFrame)
             {
                 double k = alphaDur <= 0 ? 1 : Math.Min(1, (DateTime.Now - alphaT0).TotalSeconds / alphaDur);
                 k = k * k * (3 - 2 * k);
@@ -949,6 +1023,9 @@ namespace GPTBootAnimation
                 intro.Volume = volFrom + (volTo - volFrom) * k;
                 if (k >= 1) volDur = -1;
             }
+            if (phase == Phase.Done) return;
+            var want = TimeSpan.FromMilliseconds(Busy() ? 15 : 100);
+            if (tick.Interval != want) tick.Interval = want;
         }
 
         /// 跟着 ChatGPT 窗口移动、缩放；ChatGPT 最小化或藏到托盘时一起藏起来；ChatGPT 关了就收工
@@ -975,7 +1052,7 @@ namespace GPTBootAnimation
             if (!Native.Bounds(Target.Hwnd, out r)) return;
             // 浮层被改了大小（换到缩放不同的屏时 WPF 可能按系统建议改它），或浮层所在屏的缩放变了：强制重摆一次（#7）。
             // 不只靠 WM_DPICHANGED：实测单屏改缩放时那条消息没到我们这里
-            if (!force && overlayH != IntPtr.Zero && overlayBox.Right > overlayBox.Left)
+            if (!force && overlayH != IntPtr.Zero && overlayBox.Right > overlayBox.Left && SameRect(r, lastRect))
             {
                 Native.RECT cur;
                 double sc = CurrentScale();
@@ -988,12 +1065,11 @@ namespace GPTBootAnimation
             }
             if (!force && SameRect(r, lastRect)) return;
             lastRect = r;
-            // 浮层窗口铺满 ChatGPT 所在的整块屏（ChatGPT 伸出屏幕的部分也包进来），视频那块再挪到 ChatGPT 窗口的位置。
-            // 以前浮层跟着 ChatGPT 一起改大小：分层窗口每次改大小都要整块重画，还原窗口时背景会消失 0.15～0.3 秒，深色界面上看着就是闪黑（#6）。
-            // 现在还原、最大化、拉边框只是挪里面的内容，窗口本身只在换到另一块屏、或 ChatGPT 伸出屏幕时才改大小
-            Native.RECT box;
-            if (!Native.MonitorRect(Target.Hwnd, out box)) box = r;
-            box = new Native.RECT { Left = Math.Min(box.Left, r.Left), Top = Math.Min(box.Top, r.Top), Right = Math.Max(box.Right, r.Right), Bottom = Math.Max(box.Bottom, r.Bottom) };
+            // 浮层就是目标窗口那么大、摆在同一个位置。
+            // 测试版曾让浮层铺满整块屏来躲还原时的闪黑（#6），但一块屏那么大的窗口会被 Windows 当成「有程序在全屏」：
+            // 任务栏被压到下面、通知区图标一闪一闪，拖到另一块屏时还要整块重建，背景会停住或消失几秒（#7）。
+            // 现在浮层不是逐像素透明窗口了，改大小不再整块重画，跟着窗口一起改就行
+            Native.RECT box = r;
             if (force || !SameRect(box, overlayBox))
             {
                 overlayBox = box;
@@ -1036,19 +1112,32 @@ namespace GPTBootAnimation
         {
             if (overlayH == IntPtr.Zero) return;
             long ex = Native.GetLong(overlayH, Native.GWL_EXSTYLE);
-            long want = (ex | Native.WS_EX_TOOLWINDOW | Native.WS_EX_NOACTIVATE) & ~Native.WS_EX_APPWINDOW;
+            long want = (ex | Native.WS_EX_TOOLWINDOW | Native.WS_EX_NOACTIVATE | Native.WS_EX_LAYERED) & ~Native.WS_EX_APPWINDOW;
             if (clickThrough) want |= Native.WS_EX_TRANSPARENT;
-            if (want != ex && styleFixes < 20)
+            if (want != ex && (styleFixes < 20 || (ex & Native.WS_EX_LAYERED) == 0))
             {
-                if (!force) { styleFixes++; Log.W("浮层样式被改过，已补回 0x" + ex.ToString("X") + " → 0x" + want.ToString("X")); }
+                if (!force) { styleFixes++; if (styleFixes <= 20) Log.W("浮层样式被改过，已补回 0x" + ex.ToString("X") + " → 0x" + want.ToString("X")); }
                 Native.SetLong(overlayH, Native.GWL_EXSTYLE, want);
+                if ((ex & Native.WS_EX_LAYERED) == 0) ApplyAlpha(true); // 分层样式被拿掉又补上后，透明度要重新告诉系统，不然整个窗口看不见
             }
         }
 
         void SetAlpha(double a)
         {
             alpha = Math.Max(0, Math.Min(1, a));
-            grid.Opacity = alpha;
+            ApplyAlpha();
+        }
+
+        int appliedAlpha = -1; // -1 = 还没设过
+        void ApplyAlpha() { ApplyAlpha(false); }
+        void ApplyAlpha(bool always)
+        {
+            if (Dev.PerPixel) { grid.Opacity = alpha; return; }
+            if (overlayH == IntPtr.Zero) return;
+            int b = (int)Math.Round((waitFrame ? 0 : alpha) * 255);
+            if (b == appliedAlpha && !always) return;
+            appliedAlpha = b;
+            Native.SetLayeredWindowAttributes(overlayH, 0, (byte)b, Native.LWA_ALPHA);
         }
 
         void RampAlpha(double to, double seconds, Action then)
@@ -1160,6 +1249,8 @@ namespace GPTBootAnimation
             if (phase == Phase.Done) return;
             phase = Phase.Done;
             if (tick != null) tick.Stop();
+            foreach (var hk in hooks) { try { Native.UnhookWinEvent(hk); } catch { } }
+            hooks.Clear();
             try { SystemEvents.SessionSwitch -= onSession; SystemEvents.DisplaySettingsChanged -= onDisplay; } catch { }
             if (powerNotify != IntPtr.Zero) { try { Native.UnregisterPowerSettingNotification(powerNotify); } catch { } powerNotify = IntPtr.Zero; }
             foreach (var m in new[] { intro, loopA, loopB, retiring })
@@ -1354,7 +1445,17 @@ namespace GPTBootAnimation
             Dev.StallTestSec = ArgD("--stall-test", Dev.StallTestSec);
             Dev.RecycleEvery = (int)ArgD("--recycle-every", Dev.RecycleEvery);
             Dev.HeartbeatSec = ArgD("--heartbeat", Dev.HeartbeatSec);
-            Log.W("启动 " + string.Join(" ", args) + "  程序目录 " + AppDomain.CurrentDomain.BaseDirectory + "  缩放模式 " + Program.DpiMode);
+            Dev.PerfSec = ArgD("--perf-log", Dev.PerfSec);
+            Dev.PerPixel = Arg("--overlay-mode") == "perpixel";
+            Log.W("启动 " + string.Join(" ", args) + "  程序目录 " + AppDomain.CurrentDomain.BaseDirectory + "  缩放模式 " + Program.DpiMode
+                + "  显卡渲染等级 " + (RenderCapability.Tier >> 16) + "  浮层 " + (Dev.PerPixel ? "逐像素透明（老）" : "整窗透明（新）"));
+            if (Dev.PerfSec > 0)
+            {
+                Perf.Sample();
+                var perf = new DispatcherTimer { Interval = TimeSpan.FromSeconds(Dev.PerfSec) };
+                perf.Tick += delegate { Log.W("性能：" + Perf.Sample()); };
+                perf.Start();
+            }
 
             if (Arg("--render-subtitle") != null) { RenderSubtitleTest(); return; }
 

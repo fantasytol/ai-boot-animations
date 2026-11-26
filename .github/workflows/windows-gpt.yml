@@ -150,6 +150,62 @@ jobs:
             Remove-Item out\seam\$mode.mp4 -ErrorAction SilentlyContinue   # 录屏不推到仓库，只留数据
           }
           if (Test-Path $cfgBak) { Move-Item $cfgBak "$cfgDir\config.json" -Force } else { Remove-Item "$cfgDir\config.json" -ErrorAction SilentlyContinue }
+      - name: 性能对比（老的逐像素透明浮层 vs 新的整窗透明浮层；云端没有显卡，是软件渲染，只看相对差别）
+        run: |
+          $log = "$env:LOCALAPPDATA\GPTBootAnimation\log.txt"
+          New-Item -ItemType Directory -Force out\perf | Out-Null
+          # 「性能：」用码位拼，免得脚本编码出岔子
+          $tag = [string]::Concat([char[]](0x6027,0x80FD,0xFF1A))
+          foreach ($mode in @('perpixel', 'layered')) {
+            $before = @(Get-Content $log -Encoding UTF8 -ErrorAction SilentlyContinue).Count
+            $np = Start-Process notepad -WindowStyle Maximized -PassThru
+            Start-Sleep 3
+            $app = Start-Process build\GPTBootAnimation.exe -PassThru -ArgumentList "--target-title Notepad --play loop --exit-after 50 --perf-log 10 --overlay-mode $mode --shot-at 20 --shot-dir `"$pwd\out\perf\$mode`""
+            $app | Wait-Process -Timeout 90 -ErrorAction SilentlyContinue; $app | Stop-Process -Force -ErrorAction SilentlyContinue
+            Stop-Process $np -Force -ErrorAction SilentlyContinue
+            $new = @(@(Get-Content $log -Encoding UTF8 -ErrorAction SilentlyContinue) | Select-Object -Skip $before)
+            "[$mode]" | Tee-Object -Append out\perf\summary.txt
+            $new | Where-Object { $_.Contains($tag) } | Tee-Object -Append out\perf\summary.txt
+          }
+      - name: 还原 / 最大化切换时有没有闪（#6 回归；只看还原后窗口里面那一块）
+        run: |
+          $env:Path += ";C:\ProgramData\chocolatey\bin"
+          Add-Type -Name W -Namespace U -MemberDefinition '[DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int c); [DllImport("user32.dll")] public static extern bool MoveWindow(IntPtr h, int x, int y, int w, int ht, bool r);'
+          $cfgDir = "$env:APPDATA\GPTBootAnimation"
+          New-Item -ItemType Directory -Force $cfgDir, out\resize | Out-Null
+          $cfgBak = "$cfgDir\config.json.bak2"
+          if (Test-Path "$cfgDir\config.json") { Copy-Item "$cfgDir\config.json" $cfgBak -Force }
+          Set-Content "$cfgDir\config.json" '{ "residualAlpha" : 1.0 }' -Encoding UTF8
+          foreach ($mode in @('perpixel', 'layered')) {
+            $np = Start-Process notepad -PassThru
+            Start-Sleep 2
+            $np.Refresh(); $h = $np.MainWindowHandle
+            [U.W]::ShowWindow($h, 9) | Out-Null
+            [U.W]::MoveWindow($h, 100, 100, 1000, 700, $true) | Out-Null
+            Start-Sleep 1
+            $app = Start-Process build\GPTBootAnimation.exe -PassThru -ArgumentList "--target-title Notepad --play loop --exit-after 30 --overlay-mode $mode"
+            Start-Sleep 5
+            $rec = Start-Process ffmpeg -PassThru -NoNewWindow -ArgumentList "-v error -y -f gdigrab -framerate 60 -offset_x 200 -offset_y 200 -video_size 800 500 -t 18 -i desktop -vf scale=320:-1 -c:v libx264 -preset ultrafast -crf 18 out\resize\$mode.mp4"
+            Start-Sleep 1
+            for ($i = 0; $i -lt 8; $i++) { [U.W]::ShowWindow($h, 3) | Out-Null; Start-Sleep -Milliseconds 1000; [U.W]::ShowWindow($h, 9) | Out-Null; Start-Sleep -Milliseconds 1000 }
+            $rec | Wait-Process -Timeout 60 -ErrorAction SilentlyContinue
+            $app | Wait-Process -Timeout 60 -ErrorAction SilentlyContinue; $app | Stop-Process -Force -ErrorAction SilentlyContinue
+            Stop-Process $np -Force -ErrorAction SilentlyContinue
+            ffmpeg -v error -i out\resize\$mode.mp4 -vf "signalstats,metadata=print:key=lavfi.signalstats.YAVG:file=out/resize/$mode-yavg.txt" -f null -
+            $t = $null; $prev = $null; $rows = @()
+            foreach ($line in Get-Content "out\resize\$mode-yavg.txt") {
+              if ($line -match 'pts_time:([0-9.]+)') { $t = [double]$matches[1] }
+              elseif ($line -match 'YAVG=([0-9.]+)') {
+                $y = [double]$matches[1]
+                if ($prev -ne $null -and [Math]::Abs($y - $prev) -gt 3) { $rows += ('t={0:N3}s  {1:N1} -> {2:N1}' -f $t, $prev, $y) }
+                $prev = $y
+              }
+            }
+            "[$mode] resize: frames with brightness jump > 3: $($rows.Count)" | Tee-Object -Append out\resize\summary.txt
+            $rows | Select-Object -First 40 | Tee-Object -Append out\resize\summary.txt
+            Remove-Item out\resize\$mode.mp4 -ErrorAction SilentlyContinue
+          }
+          if (Test-Path $cfgBak) { Move-Item $cfgBak "$cfgDir\config.json" -Force } else { Remove-Item "$cfgDir\config.json" -ErrorAction SilentlyContinue }
       - name: 收集日志
         if: always()
         run: |
