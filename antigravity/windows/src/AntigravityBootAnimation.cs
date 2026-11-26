@@ -847,8 +847,11 @@ namespace AntigravityBootAnimation
             swapFrom = null; swapTo = null;
             if (from == intro)
             {
-                intro.Visibility = Visibility.Collapsed;
-                intro.Stop(); intro.Close();
+                // 开屏 0.25 秒淡出再关（跟重建时撤旧画面一样）。以前一下子收掉，云端录屏偶尔在这一刻漏出一帧黑
+                var iv = intro;
+                var fade = new DoubleAnimation(0, TimeSpan.FromSeconds(0.25));
+                fade.Completed += delegate { iv.Visibility = Visibility.Collapsed; iv.Stop(); iv.Close(); };
+                iv.BeginAnimation(UIElement.OpacityProperty, fade);
                 return;
             }
             Promote(from, to);
