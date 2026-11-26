@@ -227,6 +227,9 @@ namespace AntigravityBootAnimation
         [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr h, IntPtr after, int x, int y, int cx, int cy, uint flags);
         [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int cmd);
         [DllImport("user32.dll")] public static extern bool SetLayeredWindowAttributes(IntPtr h, uint key, byte alpha, uint flags);
+        public delegate void WinEventProc(IntPtr hook, uint ev, IntPtr h, int idObject, int idChild, uint thread, uint time);
+        [DllImport("user32.dll")] public static extern IntPtr SetWinEventHook(uint evMin, uint evMax, IntPtr mod, WinEventProc proc, uint pid, uint tid, uint flags);
+        [DllImport("user32.dll")] public static extern bool UnhookWinEvent(IntPtr hook);
         [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
         [DllImport("user32.dll")] static extern bool SetProcessDpiAwarenessContext(IntPtr ctx);
         [DllImport("shcore.dll")] static extern int SetProcessDpiAwareness(int v);
@@ -407,9 +410,76 @@ namespace AntigravityBootAnimation
         public static int StallMs = 3000;       // 画面多久没动算卡住
         public static int RecycleEvery = 10;    // --recycle-every 圈：每放这么多圈，把后台待命的播放器换成新的（0 = 不换）
         public static double HeartbeatSec = 600; // --heartbeat 秒：循环背景每隔多久往日志里报一次平安
+        public static double PerfSec = 0;       // --perf-log 秒：每隔这么久往日志里记一次 CPU / 内存（测性能用）
+        // --overlay-mode：浮层怎么做。hosted = 系统分层外壳窗口 + 里面嵌 WPF 画面（默认）；
+        // perpixel = 老的 WPF 逐像素透明窗口（只为对比性能）；opaque = 完全不透明（只为测性能下限，画面不对）
+        public static string OverlayMode = "hosted";
+        public static bool PerPixel { get { return OverlayMode == "perpixel"; } }
+        public static bool Hosted { get { return OverlayMode == "hosted"; } }
+    }
+
+    /// 本进程 CPU 占用：两次采样之间用掉的 CPU 时间 ÷ 经过的时间 ÷ 核数，跟任务管理器「CPU」那一列同一个算法
+    public static class Perf
+    {
+        static TimeSpan lastCpu; static DateTime lastWall;
+        public static string Sample()
+        {
+            try
+            {
+                using (var p = Process.GetCurrentProcess())
+                {
+                    var cpu = p.TotalProcessorTime; var now = DateTime.UtcNow;
+                    string pct = "";
+                    if (lastWall != DateTime.MinValue)
+                    {
+                        double wall = (now - lastWall).TotalMilliseconds;
+                        if (wall > 0) pct = (100.0 * (cpu - lastCpu).TotalMilliseconds / wall / Environment.ProcessorCount).ToString("0.0", CultureInfo.InvariantCulture) + "%";
+                    }
+                    lastCpu = cpu; lastWall = now;
+                    return "CPU " + (pct == "" ? "（首次采样）" : pct) + "，内存 " + (p.WorkingSet64 / 1048576) + "MB（私有 " + (p.PrivateMemorySize64 / 1048576) + "MB），句柄 " + p.HandleCount;
+                }
+            }
+            catch (Exception ex) { return "性能采样失败：" + ex.Message; }
+        }
     }
 
     // ───────────────────────── 一次播放 ─────────────────────────
+
+    /// 浮层的外壳：系统自己的分层窗口，整窗透明度用 SetLayeredWindowAttributes 交给桌面合成器在显卡上混合；
+    /// WPF 画面嵌在里面当子窗口，照常用显卡画。
+    /// 不直接用 WPF 窗口：WPF 的窗口要半透明只能开逐像素透明（每帧把整块画面拷回内存、CPU 混合，#9 的 CPU 20%+ 就是它），
+    /// 自己给 WPF 窗口加分层样式又会被 WPF 当场拿掉
+    public class HostForm : WF.Form
+    {
+        public bool ClickThrough;
+        public delegate IntPtr MsgHook(IntPtr h, int msg, IntPtr w, IntPtr l, ref bool handled);
+        public MsgHook OnMsg;
+        public HostForm(string title)
+        {
+            FormBorderStyle = WF.FormBorderStyle.None; ShowInTaskbar = false; BackColor = SD.Color.Black;
+            StartPosition = WF.FormStartPosition.Manual; Location = new SD.Point(-32000, -32000); Size = new SD.Size(10, 10); Text = title;
+        }
+        protected override bool ShowWithoutActivation { get { return true; } }
+        protected override WF.CreateParams CreateParams
+        {
+            get
+            {
+                var cp = base.CreateParams;
+                cp.Style = unchecked((int)0x80000000) | 0x02000000;   // WS_POPUP | WS_CLIPCHILDREN
+                cp.ExStyle = (cp.ExStyle | 0x80000 /*LAYERED*/ | 0x80 /*TOOLWINDOW*/ | 0x8000000 /*NOACTIVATE*/ | (ClickThrough ? 0x20 : 0)) & ~0x40000 /*APPWINDOW*/;
+                return cp;
+            }
+        }
+        protected override void WndProc(ref WF.Message m)
+        {
+            if (OnMsg != null)
+            {
+                bool handled = false;
+                try { OnMsg(m.HWnd, m.Msg, m.WParam, m.LParam, ref handled); } catch (Exception ex) { Log.W("浮层消息处理出错：" + ex.Message); }
+            }
+            base.WndProc(ref m);
+        }
+    }
 
     public class Show
     {
@@ -423,6 +493,7 @@ namespace AntigravityBootAnimation
 
         Window overlay, top;
         IntPtr overlayH, topH;
+        HostForm host; HwndSource childSrc; IntPtr childH;   // hosted 模式：外壳窗口和里面的 WPF 画面
         Grid grid, root;
         int styleFixes;
         MediaElement intro, loopA, loopB, activeLoop;
@@ -501,27 +572,43 @@ namespace AntigravityBootAnimation
             // 一个窗口三层：最下面视频（整体调透明度做半透明背景），上面字幕和「跳过」（不跟着变淡）
             root = new Grid { Background = Brushes.Transparent, HorizontalAlignment = HorizontalAlignment.Left, VerticalAlignment = VerticalAlignment.Top }; // 位置大小由 PlaceContent 按 Antigravity 窗口定
             root.Children.Add(grid);
-            overlay = new Window
-            {
-                WindowStyle = WindowStyle.None, AllowsTransparency = true, ResizeMode = ResizeMode.NoResize, ShowInTaskbar = false,
-                ShowActivated = false, Background = Brushes.Transparent, Content = root,
-                Left = -32000, Top = -32000, Width = 10, Height = 10, Title = "Gemini Boot Animation"
-            };
             clickThrough = !withIntro;
             alpha = 0; // 开屏也从透明淡入（0.3 秒），不再一出现就整块黑屏盖上去
-            grid.Opacity = alpha;
-            overlay.SourceInitialized += delegate
+            grid.Opacity = Dev.PerPixel ? alpha : 1;
+            waitFrame = !withIntro && !Dev.PerPixel; // 直接开循环背景时，等视频出了第一帧再淡入（外壳窗口是黑底，没出帧时是黑的）
+            disp = Dispatcher.CurrentDispatcher;
+            if (Dev.Hosted)
             {
-                overlayH = new WindowInteropHelper(overlay).Handle;
-                EnsureOverlayStyle(true);
-                // 收系统的睡眠唤醒、显示器亮灭通知（这两种之后视频画面最容易冻住）
-                var hs = HwndSource.FromHwnd(overlayH);
-                if (hs != null) hs.AddHook(WndProc);
-                try { Guid g = Native.GUID_CONSOLE_DISPLAY_STATE; powerNotify = Native.RegisterPowerSettingNotification(overlayH, ref g, 0); }
-                catch (Exception ex) { Log.W("显示器亮灭通知注册失败：" + ex.Message); }
-                // 设成 Antigravity 窗口的「附属窗口」：系统自动让它一直在 Antigravity 上面，Antigravity 被别的窗口挡住时它也一起被挡住
-                Native.SetLong(overlayH, Native.GWLP_HWNDPARENT, Target.Hwnd.ToInt64());
-            };
+                host = new HostForm("Gemini Boot Animation") { ClickThrough = clickThrough };
+                host.OnMsg = WndProc;
+                overlayH = host.Handle;          // 这一步建出窗口
+                ApplyAlpha(true);                // 分层窗口建好后先设成全透明，不然在设之前是看不见也点不到的状态
+                InitOverlayHandle();
+                childSrc = new HwndSource(new HwndSourceParameters("Gemini Boot Animation")
+                {
+                    ParentWindow = overlayH, WindowStyle = 0x50000000 /*WS_CHILD | WS_VISIBLE*/, PositionX = 0, PositionY = 0, Width = 10, Height = 10
+                });
+                childSrc.CompositionTarget.BackgroundColor = Colors.Black;
+                childSrc.RootVisual = root;
+                childH = childSrc.Handle;
+            }
+            else
+            {
+                overlay = new Window
+                {
+                    WindowStyle = WindowStyle.None, AllowsTransparency = Dev.PerPixel, ResizeMode = ResizeMode.NoResize, ShowInTaskbar = false,
+                    ShowActivated = false, Background = Dev.PerPixel ? Brushes.Transparent : Brushes.Black, Content = root,
+                    Left = -32000, Top = -32000, Width = 10, Height = 10, Title = "Gemini Boot Animation"
+                };
+                overlay.SourceInitialized += delegate
+                {
+                    overlayH = new WindowInteropHelper(overlay).Handle;
+                    EnsureOverlayStyle(true);
+                    var hs = HwndSource.FromHwnd(overlayH);
+                    if (hs != null) hs.AddHook(WndProc);
+                    InitOverlayHandle();
+                };
+            }
 
             if (withIntro)
             {
@@ -547,11 +634,12 @@ namespace AntigravityBootAnimation
                 topGrid.Children.Add(skipBtn);
             }
 
-            overlay.Show();
+            if (host != null) host.Show(); else overlay.Show();
             EnsureOverlayStyle(true); // WPF 显示窗口时会重写扩展样式，显示后再补一次
             if (top != null) top.Show();
             Follow(true);
-            Log.W("浮层样式 0x" + Native.GetLong(overlayH, Native.GWL_EXSTYLE).ToString("X"));
+            long st = Native.GetLong(overlayH, Native.GWL_EXSTYLE);
+            Log.W("浮层样式 0x" + st.ToString("X") + " layered=" + ((st & Native.WS_EX_LAYERED) != 0 ? 1 : 0) + " mode=" + Dev.OverlayMode);
 
             if (withIntro)
             {
@@ -581,9 +669,53 @@ namespace AntigravityBootAnimation
             nextBeatMs = (long)(Dev.HeartbeatSec * 1000);
             nextStallTestMs = (long)(Dev.StallTestSec * 1000);
 
+            // 跟窗口：不再每 15 毫秒去问一次窗口在哪，改成让系统在目标窗口移动、缩放、最小化、隐藏时通知我们，马上跟上
+            winEvent = OnWinEvent;
+            foreach (var rng in new[] { new uint[] { 0x0016, 0x0017 } /*最小化开始/结束*/, new uint[] { 0x8002, 0x8003 } /*显示/隐藏*/,
+                                      new uint[] { 0x800B, 0x800B } /*位置变了*/, new uint[] { 0x8017, 0x8018 } /*被系统藏起/放出*/ })
+            {
+                IntPtr hk = Native.SetWinEventHook(rng[0], rng[1], IntPtr.Zero, winEvent, Target.Pid, 0, 0 /*WINEVENT_OUTOFCONTEXT*/);
+                if (hk != IntPtr.Zero) hooks.Add(hk);
+            }
+            if (hooks.Count < 4) Log.W("窗口事件通知只挂上 " + hooks.Count + "/4 个，靠定时检查兜底");
+
+            // 定时器只做杂事（交接、自愈、渐变、字幕）：要掐时间的时候 15 毫秒一次，平时 100 毫秒一次
             tick = new DispatcherTimer(DispatcherPriority.Render) { Interval = TimeSpan.FromMilliseconds(15) };
             tick.Tick += delegate { Tick(); };
             tick.Start();
+        }
+
+        readonly List<IntPtr> hooks = new List<IntPtr>();
+        Native.WinEventProc winEvent;   // 留着引用，不然被回收后系统回调会崩
+        bool waitFrame;
+
+        void OnWinEvent(IntPtr hook, uint ev, IntPtr h, int idObject, int idChild, uint thread, uint time)
+        {
+            if (h != Target.Hwnd || idObject != 0 /*OBJID_WINDOW*/ || idChild != 0 || phase == Phase.Done) return;
+            try { Follow(false); } catch (Exception ex) { Log.W("跟随窗口出错：" + ex.Message); }
+        }
+
+        /// 现在是不是要掐时间：开屏、渐变、接缝、交接快到点、重建中——这些时候定时器跑快档
+        bool Busy()
+        {
+            if (!introGone || alphaDur >= 0 || volDur >= 0 || swapFrom != null || handTo != null || retiring != null || pendingAt > 0 || waitFrame) return true;
+            if (overlapLoop && activeLoop != null && !paused && activeLoop.NaturalDuration.HasTimeSpan)
+            {
+                double half = activeLoop.NaturalDuration.TimeSpan.TotalSeconds / 2, pos = activeLoop.Position.TotalSeconds;
+                if (pos >= half - handLead - 0.3) return true;
+            }
+            if (!overlapLoop && activeLoop != null && activeLoop.NaturalDuration.HasTimeSpan
+                && activeLoop.Position.TotalSeconds >= activeLoop.NaturalDuration.TimeSpan.TotalSeconds - 0.3) return true;
+            return Dev.LoopCutSec > 0;
+        }
+
+        /// 浮层窗口建好后：收系统的睡眠唤醒、显示器亮灭通知（这两种之后视频画面最容易冻住），
+        /// 并设成目标窗口的「附属窗口」：系统自动让它一直在目标窗口上面，目标窗口被别的窗口挡住时它也一起被挡住
+        void InitOverlayHandle()
+        {
+            try { Guid g = Native.GUID_CONSOLE_DISPLAY_STATE; powerNotify = Native.RegisterPowerSettingNotification(overlayH, ref g, 0); }
+            catch (Exception ex) { Log.W("显示器亮灭通知注册失败：" + ex.Message); }
+            Native.SetLong(overlayH, Native.GWLP_HWNDPARENT, Target.Hwnd.ToInt64());
         }
 
         IntPtr WndProc(IntPtr h, int msg, IntPtr wParam, IntPtr lParam, ref bool handled)
@@ -594,7 +726,7 @@ namespace AntigravityBootAnimation
                 // 等它处理完，再按新缩放把浮层铺回整块屏、把视频摆回窗口位置，免得背景变小或错位到窗口再动一下才好
                 int dpi = (int)(wParam.ToInt64() & 0xFFFF);
                 Log.W("浮层换到缩放 " + (dpi * 100 / 96) + "% 的屏，重新摆放");
-                overlay.Dispatcher.BeginInvoke(new Action(delegate { if (phase != Phase.Done) Follow(true); }));
+                disp.BeginInvoke(new Action(delegate { if (phase != Phase.Done) Follow(true); }));
                 return IntPtr.Zero;
             }
             if (msg != 0x218 /*WM_POWERBROADCAST*/) return IntPtr.Zero;
@@ -856,9 +988,7 @@ namespace AntigravityBootAnimation
             if (now >= nextBeatMs)
             {
                 nextBeatMs = now + (long)(Math.Max(1, Dev.HeartbeatSec) * 1000);
-                string mem = "";
-                try { using (var pr = Process.GetCurrentProcess()) mem = "，内存 " + (pr.WorkingSet64 / 1048576) + "MB，句柄 " + pr.HandleCount; } catch { }
-                Log.W("循环背景运行中：已循环 " + laps + " 圈，自动恢复 " + recoveries + " 次，进度 " + p.ToString("0.00", CultureInfo.InvariantCulture) + " 秒" + mem);
+                Log.W("循环背景运行中：已循环 " + laps + " 圈，自动恢复 " + recoveries + " 次，进度 " + p.ToString("0.00", CultureInfo.InvariantCulture) + " 秒，" + Perf.Sample());
             }
             if (Math.Abs(p - lastPos) > 0.0005)
             {
@@ -936,7 +1066,13 @@ namespace AntigravityBootAnimation
                 if (phase == Phase.Intro && t >= config.FadeStartSeconds) Reveal(false);
                 UpdateSubtitle(t);
             }
-            if (alphaDur >= 0)
+            if (waitFrame)
+            {
+                // 视频还没出第一帧：保持全透明、渐变先不开始计时
+                if (activeLoop != null && activeLoop.Position.TotalSeconds > 0.05) { waitFrame = false; alphaT0 = DateTime.Now; }
+                else alphaT0 = DateTime.Now;
+            }
+            if (alphaDur >= 0 && !waitFrame)
             {
                 double k = alphaDur <= 0 ? 1 : Math.Min(1, (DateTime.Now - alphaT0).TotalSeconds / alphaDur);
                 k = k * k * (3 - 2 * k);
@@ -949,6 +1085,9 @@ namespace AntigravityBootAnimation
                 intro.Volume = volFrom + (volTo - volFrom) * k;
                 if (k >= 1) volDur = -1;
             }
+            if (phase == Phase.Done) return;
+            var want = TimeSpan.FromMilliseconds(Busy() ? 15 : 100);
+            if (tick.Interval != want) tick.Interval = want;
         }
 
         /// 跟着 Antigravity 窗口移动、缩放；Antigravity 最小化或藏到托盘时一起藏起来；Antigravity 关了就收工
@@ -975,7 +1114,7 @@ namespace AntigravityBootAnimation
             if (!Native.Bounds(Target.Hwnd, out r)) return;
             // 浮层被改了大小（换到缩放不同的屏时 WPF 可能按系统建议改它），或浮层所在屏的缩放变了：强制重摆一次（#7）。
             // 不只靠 WM_DPICHANGED：实测单屏改缩放时那条消息没到我们这里
-            if (!force && overlayH != IntPtr.Zero && overlayBox.Right > overlayBox.Left)
+            if (!force && overlayH != IntPtr.Zero && overlayBox.Right > overlayBox.Left && SameRect(r, lastRect))
             {
                 Native.RECT cur;
                 double sc = CurrentScale();
@@ -988,27 +1127,28 @@ namespace AntigravityBootAnimation
             }
             if (!force && SameRect(r, lastRect)) return;
             lastRect = r;
-            // 浮层窗口铺满 Antigravity 所在的整块屏（Antigravity 伸出屏幕的部分也包进来），视频那块再挪到 Antigravity 窗口的位置。
-            // 以前浮层跟着 Antigravity 一起改大小：分层窗口每次改大小都要整块重画，还原窗口时背景会消失 0.15～0.3 秒，深色界面上看着就是闪黑（#6）。
-            // 现在还原、最大化、拉边框只是挪里面的内容，窗口本身只在换到另一块屏、或 Antigravity 伸出屏幕时才改大小
-            Native.RECT box;
-            if (!Native.MonitorRect(Target.Hwnd, out box)) box = r;
-            box = new Native.RECT { Left = Math.Min(box.Left, r.Left), Top = Math.Min(box.Top, r.Top), Right = Math.Max(box.Right, r.Right), Bottom = Math.Max(box.Bottom, r.Bottom) };
+            // 浮层就是目标窗口那么大、摆在同一个位置。
+            // 测试版曾让浮层铺满整块屏来躲还原时的闪黑（#6），但一块屏那么大的窗口会被 Windows 当成「有程序在全屏」：
+            // 任务栏被压到下面、通知区图标一闪一闪，拖到另一块屏时还要整块重建，背景会停住或消失几秒（#7）。
+            // 现在浮层不是逐像素透明窗口了，改大小不再整块重画，跟着窗口一起改就行
+            Native.RECT box = r;
             if (force || !SameRect(box, overlayBox))
             {
                 overlayBox = box;
                 uint f = Native.SWP_NOZORDER | Native.SWP_NOACTIVATE | Native.SWP_NOOWNERZORDER;
                 if (overlayH != IntPtr.Zero) Native.SetWindowPos(overlayH, IntPtr.Zero, box.Left, box.Top, box.Right - box.Left, box.Bottom - box.Top, f);
+                if (childH != IntPtr.Zero) Native.SetWindowPos(childH, IntPtr.Zero, 0, 0, box.Right - box.Left, box.Bottom - box.Top, f);
                 if (topH != IntPtr.Zero) Native.SetWindowPos(topH, IntPtr.Zero, box.Left, box.Top, box.Right - box.Left, box.Bottom - box.Top, f);
             }
             PlaceContent(r, box);
         }
 
         Native.RECT overlayBox;
+        PresentationSource Src() { return childSrc != null ? (PresentationSource)childSrc : PresentationSource.FromVisual(overlay); }
         double placedScale = 1;
         double CurrentScale()
         {
-            var src = PresentationSource.FromVisual(overlay);
+            var src = Src();
             return src != null && src.CompositionTarget != null ? src.CompositionTarget.TransformFromDevice.M11 : 1;
         }
         static bool SameRect(Native.RECT a, Native.RECT b) { return a.Left == b.Left && a.Top == b.Top && a.Right == b.Right && a.Bottom == b.Bottom; }
@@ -1016,7 +1156,7 @@ namespace AntigravityBootAnimation
         /// 把视频、字幕、「跳过」那一层摆到 Antigravity 窗口在浮层里的位置（物理像素换成 WPF 的逻辑单位）
         void PlaceContent(Native.RECT r, Native.RECT box)
         {
-            var src = PresentationSource.FromVisual(overlay);
+            var src = Src();
             Matrix m = src != null && src.CompositionTarget != null ? src.CompositionTarget.TransformFromDevice : Matrix.Identity;
             placedScale = m.M11;
             root.Margin = new Thickness((r.Left - box.Left) * m.M11, (r.Top - box.Top) * m.M22, 0, 0);
@@ -1037,18 +1177,32 @@ namespace AntigravityBootAnimation
             if (overlayH == IntPtr.Zero) return;
             long ex = Native.GetLong(overlayH, Native.GWL_EXSTYLE);
             long want = (ex | Native.WS_EX_TOOLWINDOW | Native.WS_EX_NOACTIVATE) & ~Native.WS_EX_APPWINDOW;
+            if (Dev.Hosted) want |= Native.WS_EX_LAYERED;
             if (clickThrough) want |= Native.WS_EX_TRANSPARENT;
-            if (want != ex && styleFixes < 20)
+            if (want != ex && (styleFixes < 20 || (Dev.Hosted && (ex & Native.WS_EX_LAYERED) == 0)))
             {
-                if (!force) { styleFixes++; Log.W("浮层样式被改过，已补回 0x" + ex.ToString("X") + " → 0x" + want.ToString("X")); }
+                if (!force) { styleFixes++; if (styleFixes <= 20) Log.W("浮层样式被改过，已补回 0x" + ex.ToString("X") + " → 0x" + want.ToString("X")); }
                 Native.SetLong(overlayH, Native.GWL_EXSTYLE, want);
+                if (Dev.Hosted && (ex & Native.WS_EX_LAYERED) == 0) ApplyAlpha(true); // 分层样式被拿掉又补上后，透明度要重新告诉系统，不然整个窗口看不见
             }
         }
 
         void SetAlpha(double a)
         {
             alpha = Math.Max(0, Math.Min(1, a));
-            grid.Opacity = alpha;
+            ApplyAlpha();
+        }
+
+        int appliedAlpha = -1; // -1 = 还没设过
+        void ApplyAlpha() { ApplyAlpha(false); }
+        void ApplyAlpha(bool always)
+        {
+            if (Dev.PerPixel) { grid.Opacity = alpha; return; }
+            if (!Dev.Hosted || overlayH == IntPtr.Zero) return;   // opaque 模式只测性能，不做透明
+            int b = (int)Math.Round((waitFrame ? 0 : alpha) * 255);
+            if (b == appliedAlpha && !always) return;
+            appliedAlpha = b;
+            Native.SetLayeredWindowAttributes(overlayH, 0, (byte)b, Native.LWA_ALPHA);
         }
 
         void RampAlpha(double to, double seconds, Action then)
@@ -1160,12 +1314,20 @@ namespace AntigravityBootAnimation
             if (phase == Phase.Done) return;
             phase = Phase.Done;
             if (tick != null) tick.Stop();
+            foreach (var hk in hooks) { try { Native.UnhookWinEvent(hk); } catch { } }
+            hooks.Clear();
             try { SystemEvents.SessionSwitch -= onSession; SystemEvents.DisplaySettingsChanged -= onDisplay; } catch { }
             if (powerNotify != IntPtr.Zero) { try { Native.UnregisterPowerSettingNotification(powerNotify); } catch { } powerNotify = IntPtr.Zero; }
             foreach (var m in new[] { intro, loopA, loopB, retiring })
                 if (m != null) { try { m.Stop(); m.Close(); } catch { } }
             CloseTop();
-            try { overlay.Close(); } catch { }
+            try
+            {
+                if (childSrc != null) { childSrc.RootVisual = null; childSrc.Dispose(); childSrc = null; }
+                if (host != null) { host.Close(); host.Dispose(); }
+                if (overlay != null) overlay.Close();
+            }
+            catch (Exception ex) { Log.W("关浮层出错：" + ex.Message); }
             Log.W("播放结束");
             if (onDone != null) onDone();
         }
@@ -1220,7 +1382,7 @@ namespace AntigravityBootAnimation
             IntPtr hit = Native.WindowFromPoint(new Native.POINT { X = r.Left + w / 2, Y = r.Top + h / 2 });
             IntPtr root = Native.GetAncestor(hit, 2 /*GA_ROOT*/);
             string who = root == overlayH ? "浮层" : root == Target.Hwnd ? "目标窗口" : root == topH ? "字幕层" : ("其他 " + Native.ClassOf(root));
-            Log.W("截图 " + path + "  播放阶段=" + phase + " 透明度=" + alpha.ToString("0.00") + " 样式=0x" + Native.GetLong(overlayH, Native.GWL_EXSTYLE).ToString("X") + " 中心点击落到=" + who);
+            Log.W("截图 " + path + "  播放阶段=" + phase + " 透明度=" + alpha.ToString("0.00") + " 样式=0x" + Native.GetLong(overlayH, Native.GWL_EXSTYLE).ToString("X") + " 中心点击落到=" + who + " hit=" + (root == Target.Hwnd ? "target" : root == overlayH ? "overlay" : "other"));
         }
     }
 
@@ -1354,7 +1516,18 @@ namespace AntigravityBootAnimation
             Dev.StallTestSec = ArgD("--stall-test", Dev.StallTestSec);
             Dev.RecycleEvery = (int)ArgD("--recycle-every", Dev.RecycleEvery);
             Dev.HeartbeatSec = ArgD("--heartbeat", Dev.HeartbeatSec);
-            Log.W("启动 " + string.Join(" ", args) + "  程序目录 " + AppDomain.CurrentDomain.BaseDirectory + "  缩放模式 " + Program.DpiMode);
+            Dev.PerfSec = ArgD("--perf-log", Dev.PerfSec);
+            var om = Arg("--overlay-mode");
+            if (om == "perpixel" || om == "hosted" || om == "opaque") Dev.OverlayMode = om;
+            Log.W("启动 " + string.Join(" ", args) + "  程序目录 " + AppDomain.CurrentDomain.BaseDirectory + "  缩放模式 " + Program.DpiMode
+                + "  显卡渲染等级 " + (RenderCapability.Tier >> 16) + "  浮层 " + Dev.OverlayMode);
+            if (Dev.PerfSec > 0)
+            {
+                Perf.Sample();
+                var perf = new DispatcherTimer { Interval = TimeSpan.FromSeconds(Dev.PerfSec) };
+                perf.Tick += delegate { Log.W("性能：" + Perf.Sample()); };
+                perf.Start();
+            }
 
             if (Arg("--render-subtitle") != null) { RenderSubtitleTest(); return; }
 
