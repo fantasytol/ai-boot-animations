@@ -115,6 +115,29 @@ jobs:
           $healed = [string]::Concat([char[]](0x6062,0x590D,0x6210,0x529F))
           if (-not ($new | Where-Object { $_.Contains($recover) })) { throw "self-heal test: no recovery in log" }
           if (-not ($new | Where-Object { $_.Contains($healed) })) { throw "self-heal test: loop did not move again after recovery" }
+      - name: 待命播放器换失败不影响画面（#7：每换 2 次故意失败 1 次，不许触发重建）
+        run: |
+          $log = "$env:LOCALAPPDATA\ClaudeBootAnimation\log.txt"
+          $before = @(Get-Content $log -Encoding UTF8 -ErrorAction SilentlyContinue).Count
+          $np = Start-Process notepad -WindowStyle Maximized -PassThru
+          Start-Sleep 3
+          $app = Start-Process build\ClaudeBootAnimation.exe -PassThru -ArgumentList "--target-title Notepad --play loop --exit-after 30 --legacy-loop --loop-cut 0.8 --recycle-every 2 --standby-fail-test 2 --heartbeat 4"
+          $app | Wait-Process -Timeout 90 -ErrorAction SilentlyContinue; $app | Stop-Process -Force -ErrorAction SilentlyContinue
+          Stop-Process $np -Force
+          $new = @(@(Get-Content $log -Encoding UTF8 -ErrorAction SilentlyContinue) | Select-Object -Skip $before)
+          $new | ForEach-Object { Write-Host $_ }
+          # 「没换成」「自动恢复（」「运行中」
+          $failed = [string]::Concat([char[]](0x6CA1,0x6362,0x6210))
+          $recover = [string]::Concat([char[]](0x81EA,0x52A8,0x6062,0x590D,0xFF08))
+          $beat = [string]::Concat([char[]](0x8FD0,0x884C,0x4E2D))
+          $fails = @($new | Where-Object { $_.Contains($failed) })
+          if ($fails.Count -lt 2) { throw "standby-fail test: injected failures not seen ($($fails.Count))" }
+          if ($new | Where-Object { $_.Contains($recover) }) { throw "standby-fail test: a standby failure still triggered a full rebuild" }
+          $beats = @($new | Where-Object { $_.Contains($beat) })
+          if ($beats.Count -lt 2) { throw "standby-fail test: no heartbeat lines" }
+          $laps = [int]([regex]::Match($beats[-1].Substring($beats[-1].IndexOf($beat)), '\d+').Value)
+          Write-Host "laps at last heartbeat: $laps"
+          if ($laps -lt 10) { throw "standby-fail test: loop stopped advancing (laps=$laps)" }
       - name: 闪屏检测（录屏逐帧看亮度突变：老办法接缝 / 重叠交接 / 开屏接循环 / 卡住重建）
         run: |
           $env:Path += ";C:\ProgramData\chocolatey\bin"

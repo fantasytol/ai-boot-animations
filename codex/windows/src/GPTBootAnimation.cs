@@ -408,6 +408,7 @@ namespace GPTBootAnimation
         public static double LoopCutSec = 0;    // --loop-cut 秒：循环段放到这里就提前换播放器，接缝次数成倍增加，几分钟跑完平时几小时的接缝
         public static double StallTestSec = 0;  // --stall-test 秒：每隔这么久故意把正在放的播放器暂停，看自愈能不能接回来
         public static int StallMs = 3000;       // 画面多久没动算卡住
+        public static int StandbyFailEvery = 0; // --standby-fail-test N：每第 N 次换待命播放器时故意给个不存在的文件，测换失败时画面不受影响（#7）
         public static int RecycleEvery = 10;    // --recycle-every 圈：每放这么多圈，把后台待命的播放器换成新的（0 = 不换）
         public static double HeartbeatSec = 600; // --heartbeat 秒：循环背景每隔多久往日志里报一次平安
         public static double PerfSec = 0;       // --perf-log 秒：每隔这么久往日志里记一次 CPU / 内存（测性能用）
@@ -796,8 +797,19 @@ namespace GPTBootAnimation
         void OnLoopFailed(object s, ExceptionRoutedEventArgs e)
         {
             if (s != loopA && s != loopB) return;
-            Log.W("循环背景播放器报错：" + (e.ErrorException != null ? e.ErrorException.Message : "未知"));
-            LaterRebuild("播放器报错", 500);
+            var m = (MediaElement)s;
+            bool onStage = m == activeLoop || m == handTo || m == swapTo || m == swapFrom;
+            Log.W("循环背景播放器报错（" + (onStage ? "正在放的" : "待命的") + "）：" + ErrStr(e));
+            // 正在放的坏了才整个重建；待命的坏了只换待命的，正在放的不受影响（#7：以前待命的一报错就重建，画面会停一下或消失几秒）
+            if (onStage) LaterRebuild("播放器报错", 500);
+            else disp.BeginInvoke(new Action(delegate { if (phase != Phase.Done && (m == loopA || m == loopB) && m != activeLoop && m != handTo) ReplaceStandby(m); }));
+        }
+
+        static string ErrStr(ExceptionRoutedEventArgs e)
+        {
+            var x = e.ErrorException;
+            if (x == null) return "未知";
+            return x.GetType().Name + " 0x" + x.HResult.ToString("X8") + " " + x.Message;
         }
 
         /// 关掉一个播放器并从画面里拿走
@@ -904,13 +916,59 @@ namespace GPTBootAnimation
 
         /// 后台待命的那个播放器定期换成新的：同一个播放器暂停、倒回、再放成百上千次，不让它一直用下去。
         /// 它此刻垫在下面看不见，换掉不影响画面；新的自己会停在第一帧等着
+        // #7：新播放器偶尔打不开（报「找不到媒体文件」）。以前是先换上去再说，它一报错就整个重建，画面停一下或消失几秒。
+        // 现在旧的照常留着待命，新的打开成功才顶替它；打不开就扔掉新的，旧的继续用，画面完全不受影响
+        MediaElement candidate, candidateFor;   // 正在打开、还没顶上去的新待命播放器，和它要顶替的那个
+        int standbyReplaces, standbyFails;
+
         void ReplaceStandby(MediaElement old)
         {
-            var fresh = MakeLoopPlayer();
-            Panel.SetZIndex(fresh, 0);
+            DropCandidate();
+            standbyReplaces++;
+            bool inject = Dev.StandbyFailEvery > 0 && standbyReplaces % Dev.StandbyFailEvery == 0;
+            var fresh = MakePlayer(inject ? "__standby-fail-test__.mp4" : loopFile, true);
+            fresh.MediaOpened += OnCandidateOpened;
+            fresh.MediaFailed += OnCandidateFailed;
+            Panel.SetZIndex(fresh, -1);
             grid.Children.Add(fresh);
+            candidate = fresh; candidateFor = old;
+            try { old.Pause(); old.Position = TimeSpan.Zero; } catch { } // 旧的先照常退回第一帧待命
+        }
+
+        void OnCandidateOpened(object s, RoutedEventArgs e)
+        {
+            var fresh = s as MediaElement;
+            if (fresh == null || fresh != candidate) return;
+            var old = candidateFor;
+            candidate = null; candidateFor = null;
+            fresh.MediaOpened -= OnCandidateOpened; fresh.MediaFailed -= OnCandidateFailed;
+            // 旧的这会儿已经上场（正在放、正在交接）或已经被重建换掉：不顶替了，扔掉新的，下次再换
+            if (phase == Phase.Done || (old != loopA && old != loopB) || old == activeLoop || old == handTo || old == swapTo || old == swapFrom || old == retiring)
+            { DisposePlayer(fresh); return; }
+            fresh.MediaEnded += OnLoopEnded; fresh.MediaFailed += OnLoopFailed;
+            Panel.SetZIndex(fresh, 0);
             if (old == loopA) loopA = fresh; else loopB = fresh;
             DisposePlayer(old);
+            standbyFails = 0;
+        }
+
+        void OnCandidateFailed(object s, ExceptionRoutedEventArgs e)
+        {
+            var fresh = s as MediaElement;
+            if (fresh == null || fresh != candidate) return;
+            candidate = null; candidateFor = null;
+            fresh.MediaOpened -= OnCandidateOpened; fresh.MediaFailed -= OnCandidateFailed;
+            standbyFails++;
+            Log.W("待命播放器没换成（" + ErrStr(e) + "），旧的继续用，画面不受影响（连续第 " + standbyFails + " 次，已循环 " + laps + " 圈）");
+            disp.BeginInvoke(new Action(delegate { DisposePlayer(fresh); }));
+        }
+
+        void DropCandidate()
+        {
+            if (candidate == null) return;
+            var c = candidate; candidate = null; candidateFor = null;
+            c.MediaOpened -= OnCandidateOpened; c.MediaFailed -= OnCandidateFailed;
+            DisposePlayer(c);
         }
 
         // ── 自愈 ──
@@ -933,6 +991,7 @@ namespace GPTBootAnimation
             long now = clock.ElapsedMilliseconds;
             long gap = failStreak < 3 ? 8000 : 60000;
             if (lastRecoverMs >= 0 && now - lastRecoverMs < gap) return false;
+            DropCandidate();
             failStreak++;
             recoveries++; lastRecoverMs = now;
             double p = -1;
@@ -1321,7 +1380,7 @@ namespace GPTBootAnimation
             hooks.Clear();
             try { SystemEvents.SessionSwitch -= onSession; SystemEvents.DisplaySettingsChanged -= onDisplay; } catch { }
             if (powerNotify != IntPtr.Zero) { try { Native.UnregisterPowerSettingNotification(powerNotify); } catch { } powerNotify = IntPtr.Zero; }
-            foreach (var m in new[] { intro, loopA, loopB, retiring })
+            foreach (var m in new[] { intro, loopA, loopB, retiring, candidate })
                 if (m != null) { try { m.Stop(); m.Close(); } catch { } }
             CloseTop();
             try
@@ -1518,6 +1577,7 @@ namespace GPTBootAnimation
             Dev.LoopCutSec = ArgD("--loop-cut", Dev.LoopCutSec);
             Dev.StallTestSec = ArgD("--stall-test", Dev.StallTestSec);
             Dev.RecycleEvery = (int)ArgD("--recycle-every", Dev.RecycleEvery);
+            Dev.StandbyFailEvery = (int)ArgD("--standby-fail-test", Dev.StandbyFailEvery);
             Dev.HeartbeatSec = ArgD("--heartbeat", Dev.HeartbeatSec);
             Dev.PerfSec = ArgD("--perf-log", Dev.PerfSec);
             var om = Arg("--overlay-mode");
