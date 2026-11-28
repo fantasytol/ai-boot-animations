@@ -8,14 +8,18 @@ $csc = "$fw\csc.exe"
 if (-not (Test-Path $csc)) { throw "找不到系统自带的 C# 编译器（$csc）。需要 Windows 10/11。" }
 $wpf = "$fw\WPF"
 New-Item -ItemType Directory -Force -Path $Out | Out-Null
-# 不将icon放到build文件夹，最后copy的时候也不会复制，icon只在构建阶段出现
-$icoProgram = @(".\MakeIcon.exe")
-$icoPath = @(".\gpt.ico")
+# icon只在构建时使用，生成到临时目录，不会复制到build文件夹
+$icoDir = Join-Path ([IO.Path]::GetTempPath()) ([guid]::NewGuid().ToString("N"))
+New-Item -ItemType Directory -Path $icoDir | Out-Null
+$icoProgram = Join-Path $icoDir "MakeIcon.exe"
+$icoPath = Join-Path $icoDir "gpt.ico"
 $icoRefs = @("$fw\System.Drawing.dll") | ForEach-Object { "/r:$_" }
-$icoArgs = @('/nologo', '/target:winexe', '/optimize+', '/codepage:65001', '/platform:anycpu', "/out:$icoProgram") + $icoRefs + @("$PSScriptRoot\src\MakeIcon.cs")
+$icoArgs = @('/nologo', '/target:exe', '/optimize+', '/codepage:65001', '/platform:anycpu', "/out:$icoProgram") + $icoRefs + @("$PSScriptRoot\src\MakeIcon.cs")
 # 构建并运行
 & $csc @icoArgs
+if ($LASTEXITCODE -ne 0) { throw "图标生成器编译失败" }
 & $icoProgram $icoPath
+if ($LASTEXITCODE -ne 0) { throw "图标生成失败" }
 $refs = @("$wpf\PresentationFramework.dll", "$wpf\PresentationCore.dll", "$wpf\WindowsBase.dll",
           "$fw\System.Xaml.dll", "$fw\System.Windows.Forms.dll", "$fw\System.Drawing.dll",
           "$fw\System.Web.Extensions.dll", "$fw\System.Core.dll", "$fw\System.Management.dll") | ForEach-Object { "/r:$_" }
