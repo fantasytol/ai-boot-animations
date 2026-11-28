@@ -6,7 +6,7 @@ $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 # Shares the repo with the Claude version (which owns releases/latest), so pin the DeepSeek tag here. Bump together with deepseek/web-install.sh.
-$tag = 'deepseek-v1.0.0'
+$tag = 'deepseek-v1.0.1'
 $url = "https://github.com/wynneceles/ai-boot-animations/releases/download/$tag/DeepSeekBootAnimation-Windows.zip"
 if ($env:AGBA_ZIP_URL) { $url = $env:AGBA_ZIP_URL }
 function Test-Writable([string]$p) {
